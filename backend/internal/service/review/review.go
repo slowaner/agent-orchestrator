@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -118,7 +119,7 @@ type Store interface {
 	GetReviewRun(ctx context.Context, id string) (domain.ReviewRun, bool, error)
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	SetSessionAutoInjectReview(ctx context.Context, id domain.SessionID, autoInject bool, updatedAt time.Time) (bool, error)
-	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool) (bool, error)
+	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool, publication ...*domain.ReviewPublication) (bool, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
 	ListPRReviews(ctx context.Context, prURL string) ([]domain.PullRequestReview, error)
 	ListPRComments(ctx context.Context, prURL string) ([]domain.PullRequestComment, error)
@@ -818,6 +819,8 @@ type SubmittedReview struct {
 	Verdict        domain.ReviewVerdict
 	Body           string
 	GithubReviewID string
+	// Publication is the reviewer's target-bound provider receipt, if available.
+	Publication *domain.ReviewPublication
 }
 
 // Submit records a reviewer's result for a specific worker review pass.
@@ -906,8 +909,13 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	switch run.Status {
 	case domain.ReviewRunRunning:
 		if providerFromPRURL(run.PRURL) == "gitlab" && githubReviewID != "" {
-			return domain.ReviewRun{}, fmt.Errorf("%w: GitLab publication must not use a GitHub review id; record its receipt or error in the body", ErrInvalid)
+			return domain.ReviewRun{}, fmt.Errorf("%w: GitLab publication must not use a GitHub review id; supply a structured publication receipt instead", ErrInvalid)
 		}
+		publication, reviewID, err := validatePublication(run, review)
+		if err != nil {
+			return domain.ReviewRun{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+		githubReviewID = reviewID
 		session, found, err := s.store.GetSession(ctx, workerID)
 		if err != nil {
 			return domain.ReviewRun{}, err
@@ -915,7 +923,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		if !found {
 			return domain.ReviewRun{}, fmt.Errorf("%w: worker session %q", ErrNotFound, workerID)
 		}
-		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID, session.AutoInjectReview)
+		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID, session.AutoInjectReview, publication)
 		if err != nil {
 			return domain.ReviewRun{}, err
 		}
@@ -926,8 +934,9 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		run.Verdict = verdict
 		run.Body = body
 		run.GithubReviewID = githubReviewID
+		run.Publication = publication
 		run.AutoInjectReview = session.AutoInjectReview
-		if githubReviewID != "" && s.reviewRefresher != nil {
+		if run.PublishedToProvider() && s.reviewRefresher != nil {
 			s.reviewRefresher.RequestReviewRefresh(run.PRURL)
 		}
 		// Only on the real running -> complete transition. Re-submitting an
@@ -937,7 +946,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			"harness":            string(run.Harness),
 			"verdict":            string(verdict),
 			"duration_ms":        s.clock().Sub(run.CreatedAt).Milliseconds(),
-			"posted_to_provider": githubReviewID != "",
+			"posted_to_provider": run.PublishedToProvider(),
 			// Which pass produced this verdict. A manual and an automatic review
 			// mean different things about how the feature is being used, and the
 			// verdict split between them is the whole question.
@@ -951,6 +960,12 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			"auto_inject": session.AutoInjectReview,
 		})
 	case domain.ReviewRunComplete:
+		if review.Publication != nil {
+			publication, _, err := validatePublication(run, review)
+			if err != nil || !reflect.DeepEqual(publication, run.Publication) {
+				return domain.ReviewRun{}, fmt.Errorf("%w: review run %q already recorded a different publication", ErrInvalid, runID)
+			}
+		}
 		if run.Verdict != verdict {
 			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q already recorded verdict %q", ErrInvalid, runID, run.Verdict)
 		}

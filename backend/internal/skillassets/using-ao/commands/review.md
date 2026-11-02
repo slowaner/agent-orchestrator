@@ -75,7 +75,17 @@ A review without findings still publishes its summary through that operation.
 GitLab's `reviewed` state is not a formal approval. GitHub keeps its direct
 `gh api` COMMENT review workflow, including in mixed-provider queues.
 
-Keep local verdict, provider publication and worker delivery separate in `body`.
+Keep the local verdict and worker delivery separate from the optional structured
+`publication` receipt. Submit it through `--reviews` JSON with `provider`, `status`
+(`published`, `blocked`, `unconfirmed`), `prUrl`, `targetSha`, typed `refs` and
+`error` for blocked/unconfirmed. `published` requires readback of the summary note,
+every required discussion and its original finding note; include each real note
+and discussion ID. No aggregate GitLab review ID exists. Missing receipts remain
+unconfirmed. AO validates receipt binding and records the reviewer's report; it
+does not independently verify the provider. Confirmed receipts schedule normal
+read-only SCM refresh and count as provider publication in telemetry. They do not
+prove worker delivery. Original finding note IDs bind the run's injection-policy
+snapshot; replies by other authors retain their own policy.
 Leave `githubReviewId` and `--review-id` empty for new GitLab results. Select one
 project-supported route and account before any write. If the harness exposes
 neither route or permission is denied, report publication as blocked; do not

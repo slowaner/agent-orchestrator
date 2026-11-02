@@ -163,9 +163,18 @@ SELECT
           AND NOT EXISTS (
               SELECT 1
               FROM review_run
-              WHERE pr_comment.review_id != ''
+              WHERE ((pr_comment.review_id != ''
                 AND review_run.github_review_id != ''
-                AND review_run.github_review_id = pr_comment.review_id
+                AND review_run.github_review_id = pr_comment.review_id)
+                OR (review_run.pr_url = pr_comment.pr_url
+                AND json_extract(review_run.publication_json, '$.provider') = 'gitlab'
+                AND json_extract(review_run.publication_json, '$.status') = 'published'
+                AND json_extract(review_run.publication_json, '$.targetSha') = review_run.target_sha
+                AND EXISTS (
+                    SELECT 1 FROM json_each(review_run.publication_json, '$.refs') AS ref
+                    WHERE json_extract(ref.value, '$.kind') = 'note'
+                      AND json_extract(ref.value, '$.id') = pr_comment.comment_id
+                )))
           )
     ) AS external_comments,
     EXISTS (
@@ -559,9 +568,18 @@ SELECT
           AND NOT EXISTS (
               SELECT 1
               FROM review_run
-              WHERE pr_comment.review_id != ''
+              WHERE ((pr_comment.review_id != ''
                 AND review_run.github_review_id != ''
-                AND review_run.github_review_id = pr_comment.review_id
+                AND review_run.github_review_id = pr_comment.review_id)
+                OR (review_run.pr_url = pr_comment.pr_url
+                AND json_extract(review_run.publication_json, '$.provider') = 'gitlab'
+                AND json_extract(review_run.publication_json, '$.status') = 'published'
+                AND json_extract(review_run.publication_json, '$.targetSha') = review_run.target_sha
+                AND EXISTS (
+                    SELECT 1 FROM json_each(review_run.publication_json, '$.refs') AS ref
+                    WHERE json_extract(ref.value, '$.kind') = 'note'
+                      AND json_extract(ref.value, '$.id') = pr_comment.comment_id
+                )))
           )
     ) AS external_comments,
     EXISTS (
@@ -739,9 +757,18 @@ SELECT
           AND NOT EXISTS (
               SELECT 1
               FROM review_run
-              WHERE pr_comment.review_id != ''
+              WHERE ((pr_comment.review_id != ''
                 AND review_run.github_review_id != ''
-                AND review_run.github_review_id = pr_comment.review_id
+                AND review_run.github_review_id = pr_comment.review_id)
+                OR (review_run.pr_url = pr_comment.pr_url
+                AND json_extract(review_run.publication_json, '$.provider') = 'gitlab'
+                AND json_extract(review_run.publication_json, '$.status') = 'published'
+                AND json_extract(review_run.publication_json, '$.targetSha') = review_run.target_sha
+                AND EXISTS (
+                    SELECT 1 FROM json_each(review_run.publication_json, '$.refs') AS ref
+                    WHERE json_extract(ref.value, '$.kind') = 'note'
+                      AND json_extract(ref.value, '$.id') = pr_comment.comment_id
+                )))
           )
     ) AS external_comments,
     EXISTS (

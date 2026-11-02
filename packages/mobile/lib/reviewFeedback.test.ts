@@ -9,6 +9,13 @@ const run = (id: string, createdAt: string, prUrl = "https://github.com/ao/repo/
 });
 
 describe("mobile review feedback", () => {
+	it("uses confirmed GitLab note refs without fabricating a GitHub review link", () => {
+		const gl: ReviewRun = { ...run("gl", "2026-01-01", "https://gitlab.example/g/sub/r/-/merge_requests/39"), githubReviewId: "", publication: { provider: "gitlab", status: "published", prUrl: "https://gitlab.example/g/sub/r/-/merge_requests/39", targetSha: "abcdef123456", refs: [{ kind: "note", id: "101" }] } };
+		expect(reviewRunUrl(gl)).toBe(gl.prUrl + "#note_101");
+		expect(reviewRunUrl({ ...gl, publication: undefined, githubReviewId: "old-invalid-id" })).toBeUndefined();
+		expect(reviewRunUrl({ ...gl, publication: { ...gl.publication!, status: "unconfirmed", error: "timeout" } })).toBeUndefined();
+	});
+
 	it("returns every run for the selected PR in newest-first order", () => {
 		expect(reviewRunsForPullRequest([run("old", "2026-01-01"), run("other", "2026-03-01", "https://example.com/2"), run("new", "2026-02-01")], "https://github.com/ao/repo/pull/42").map((item) => item.id)).toEqual(["new", "old"]);
 	});

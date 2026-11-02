@@ -433,6 +433,12 @@ func previousReviewHistoryText(runs []domain.ReviewRun) string {
 		if run.Verdict != "" {
 			fmt.Fprintf(&b, ", verdict: %s", run.Verdict)
 		}
+		if run.Publication != nil {
+			fmt.Fprintf(&b, ", provider publication: %s (%s)", run.Publication.Status, run.Publication.Provider)
+			for _, ref := range run.Publication.Refs {
+				fmt.Fprintf(&b, ", %s: %s", ref.Kind, ref.ID)
+			}
+		}
 		if run.GithubReviewID != "" {
 			fmt.Fprintf(&b, ", GitHub review: %s", run.GithubReviewID)
 		}

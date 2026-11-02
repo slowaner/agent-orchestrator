@@ -40,6 +40,7 @@ import type { components } from "../../api/schema";
 import { interfaceTransitionIsActive, useSessionInterfaceTransitionStatus } from "../hooks/useSessionInterfaceTransition";
 import { reviewerConversationQueryKey } from "../hooks/useReviewerConversation";
 import { apiErrorMessage } from "../lib/api-client";
+import { reviewPublicationURL, reviewRunForComment } from "../lib/review-publication";
 import { clientForSessionHost } from "../lib/host-clients";
 import { sessionUiKey } from "../lib/hosts";
 import { projectNavigateTarget, sessionNavigateTarget } from "../lib/navigate-to-session";
@@ -1990,7 +1991,6 @@ function MergedReviewsSection({
 		);
 		const allUnresolvedReviewers = github?.review?.unresolvedBy ?? [];
 		const allResolvedReviewers = github?.review?.resolvedBy ?? [];
-		const agentReviewIds = new Set(aoRuns.map((run) => run.githubReviewId).filter(Boolean));
 		const agentComments = new Map<string, { inlineComments: InspectorInlineComment[]; resolvedComments: InspectorInlineComment[] }>();
 		const partitionReviewerComments = (
 			reviewers: typeof allUnresolvedReviewers,
@@ -1999,11 +1999,12 @@ function MergedReviewsSection({
 			.map((reviewer) => {
 				const externalLinks = [] as typeof reviewer.links;
 				for (const link of reviewer.links) {
-					const reviewId = link.reviewId?.trim();
-					if (!reviewId || !agentReviewIds.has(reviewId)) {
+					const nativeRun = reviewRunForComment(aoRuns, link);
+					if (!nativeRun) {
 						externalLinks.push(link);
 						continue;
 					}
+					const reviewId = nativeRun.id;
 					const comments = agentComments.get(reviewId) ?? { inlineComments: [], resolvedComments: [] };
 					const comment = {
 						autoInjectReview: link.autoInjectReview,
@@ -2040,8 +2041,8 @@ function MergedReviewsSection({
 						: formatTimeCompact(run.createdAt),
 				harness: run.harness || "reviewer",
 				id: run.id,
-				inlineComments: agentComments.get(run.githubReviewId)?.inlineComments ?? [],
-				resolvedComments: agentComments.get(run.githubReviewId)?.resolvedComments ?? [],
+				inlineComments: agentComments.get(run.id)?.inlineComments ?? [],
+				resolvedComments: agentComments.get(run.id)?.resolvedComments ?? [],
 				status: run.status,
 				url: reviewUrl ?? (ao?.prUrl || null),
 				verdict: githubVerdict(run.verdict, t),
@@ -2735,11 +2736,9 @@ function aoReviewMeta(reviewState: PRReviewState): string {
 	return `#${reviewState.prNumber}`;
 }
 
-// GitHub anchors a posted review at #pullrequestreview-<id> on the PR page; we
-// only have that link once the run has been delivered to GitHub.
+// Provider links refer to the reviewer-reported publication, not worker delivery.
 function aoReviewCommentUrl(run: PRReviewState["latestRun"]): string | null {
-	if (!run?.prUrl || !run.githubReviewId) return null;
-	return `${run.prUrl}#pullrequestreview-${run.githubReviewId}`;
+	return run ? reviewPublicationURL(run) : null;
 }
 
 function reviewVerdict(reviewState: PRReviewState): {

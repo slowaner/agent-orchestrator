@@ -72,8 +72,22 @@ func (q *Queries) InsertLegacyPRComment(ctx context.Context, arg InsertLegacyPRC
 }
 
 const listPRComments = `-- name: ListPRComments :many
-SELECT pr_url, comment_id, author, file, line, body, resolved, created_at, thread_id, url, is_bot, auto_inject_review, review_id
-FROM pr_comment WHERE pr_url = ? ORDER BY created_at, comment_id
+SELECT pr_url, comment_id, author, file, line, body, resolved, created_at, thread_id, url, is_bot,
+    COALESCE((
+        SELECT review_run.auto_inject_review FROM review_run
+        WHERE review_run.pr_url = pr_comment.pr_url
+                AND json_extract(review_run.publication_json, '$.provider') = 'gitlab'
+                AND json_extract(review_run.publication_json, '$.status') = 'published'
+                AND json_extract(review_run.publication_json, '$.targetSha') = review_run.target_sha
+                AND EXISTS (
+                    SELECT 1 FROM json_each(review_run.publication_json, '$.refs') AS ref
+                    WHERE json_extract(ref.value, '$.kind') = 'note'
+                      AND json_extract(ref.value, '$.id') = pr_comment.comment_id
+                )
+        ORDER BY review_run.created_at DESC, review_run.id DESC LIMIT 1
+    ), pr_comment.auto_inject_review) AS auto_inject_review,
+    review_id
+FROM pr_comment WHERE pr_comment.pr_url = ? ORDER BY pr_comment.created_at, pr_comment.comment_id
 `
 
 func (q *Queries) ListPRComments(ctx context.Context, prUrl string) ([]PRComment, error) {

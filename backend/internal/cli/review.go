@@ -23,19 +23,20 @@ const (
 
 // reviewRun mirrors the daemon's domain.ReviewRun for the CLI client.
 type reviewRun struct {
-	ID             string     `json:"id"`
-	ReviewID       string     `json:"reviewId"`
-	SessionID      string     `json:"sessionId"`
-	BatchID        string     `json:"batchId"`
-	Harness        string     `json:"harness"`
-	PRURL          string     `json:"prUrl"`
-	TargetSHA      string     `json:"targetSha"`
-	Status         string     `json:"status"`
-	Verdict        string     `json:"verdict"`
-	Body           string     `json:"body"`
-	GithubReviewID string     `json:"githubReviewId"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	ID             string             `json:"id"`
+	ReviewID       string             `json:"reviewId"`
+	SessionID      string             `json:"sessionId"`
+	BatchID        string             `json:"batchId"`
+	Harness        string             `json:"harness"`
+	PRURL          string             `json:"prUrl"`
+	TargetSHA      string             `json:"targetSha"`
+	Status         string             `json:"status"`
+	Verdict        string             `json:"verdict"`
+	Body           string             `json:"body"`
+	GithubReviewID string             `json:"githubReviewId"`
+	Publication    *reviewPublication `json:"publication,omitempty"`
+	CreatedAt      time.Time          `json:"createdAt"`
+	DeliveredAt    *time.Time         `json:"deliveredAt,omitempty"`
 }
 
 type reviewState struct {
@@ -88,12 +89,28 @@ type reviewRunResponse struct {
 	ReviewerHandleID string      `json:"reviewerHandleId"`
 }
 
+// reviewPublication mirrors domain.ReviewPublication without importing daemon code.
+type reviewPublication struct {
+	Provider  string                 `json:"provider"`
+	Status    string                 `json:"status"`
+	PRURL     string                 `json:"prUrl"`
+	TargetSHA string                 `json:"targetSha"`
+	Refs      []reviewPublicationRef `json:"refs,omitempty"`
+	Error     string                 `json:"error,omitempty"`
+}
+
+type reviewPublicationRef struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
 // submitReviewItem mirrors controllers.SubmitReviewItem.
 type submitReviewItem struct {
-	RunID          string `json:"runId"`
-	Verdict        string `json:"verdict"`
-	Body           string `json:"body,omitempty"`
-	GithubReviewID string `json:"githubReviewId,omitempty"`
+	RunID          string             `json:"runId"`
+	Verdict        string             `json:"verdict"`
+	Body           string             `json:"body,omitempty"`
+	GithubReviewID string             `json:"githubReviewId,omitempty"`
+	Publication    *reviewPublication `json:"publication,omitempty"`
 }
 
 // submitReviewRequest mirrors controllers.SubmitReviewInput.
@@ -102,6 +119,7 @@ type submitReviewRequest struct {
 	Verdict        string             `json:"verdict,omitempty"`
 	Body           string             `json:"body,omitempty"`
 	GithubReviewID string             `json:"githubReviewId,omitempty"`
+	Publication    *reviewPublication `json:"publication,omitempty"`
 	Reviews        []submitReviewItem `json:"reviews,omitempty"`
 }
 

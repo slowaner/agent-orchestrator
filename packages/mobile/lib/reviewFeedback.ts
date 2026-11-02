@@ -7,7 +7,13 @@ export function reviewRunsForPullRequest(runs: ReviewRun[], prUrl: string): Revi
 }
 
 export function reviewRunUrl(run: ReviewRun): string | undefined {
-	if (!run.githubReviewId || !run.prUrl) return undefined;
+	if (!run.prUrl) return undefined;
+	if (run.prUrl.includes("/-/merge_requests/")) {
+		if (run.publication?.provider !== "gitlab" || run.publication.status !== "published") return undefined;
+		const note = run.publication.refs?.find((ref) => ref.kind === "note");
+		return note ? `${run.prUrl}#note_${encodeURIComponent(note.id)}` : undefined;
+	}
+	if (!run.githubReviewId) return undefined;
 	return `${run.prUrl}#pullrequestreview-${run.githubReviewId}`;
 }
 

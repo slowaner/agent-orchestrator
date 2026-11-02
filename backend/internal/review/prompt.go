@@ -14,9 +14,15 @@ import (
 //
 // The texts are self-contained — they carry the ids the reviewer needs to
 // submit — so no environment variables are required.
-func reviewTexts(spec LaunchSpec) (prompt, systemPrompt string) {
-	systemPrompt = reviewSystemPrompt()
+func reviewTexts(spec LaunchSpec) (string, string) {
+	if hasGitLabReview(spec) {
+		return providerReviewTexts(spec)
+	}
+	return githubReviewTexts(spec)
+}
 
+func githubReviewTexts(spec LaunchSpec) (prompt, systemPrompt string) {
+	systemPrompt = reviewSystemPrompt()
 	queueText := reviewQueueText(spec)
 	prompt = fmt.Sprintf(`Review the requested implementation pull request(s) owned by worker session %s.
 %s

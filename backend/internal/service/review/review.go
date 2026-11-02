@@ -903,9 +903,11 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	if run.SessionID != workerID {
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q does not belong to worker %q", ErrInvalid, runID, workerID)
 	}
-
 	switch run.Status {
 	case domain.ReviewRunRunning:
+		if providerFromPRURL(run.PRURL) == "gitlab" && githubReviewID != "" {
+			return domain.ReviewRun{}, fmt.Errorf("%w: GitLab publication must not use a GitHub review id; record its receipt or error in the body", ErrInvalid)
+		}
 		session, found, err := s.store.GetSession(ctx, workerID)
 		if err != nil {
 			return domain.ReviewRun{}, err

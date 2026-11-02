@@ -14,7 +14,7 @@ requested provider review and comments directly. Do not run `ao review trigger`,
 create an ownership-only placeholder, or require an implementation owner just
 to review the PR.
 
-AO's review is internal. An AO approval is not a GitHub approval: it does not
+AO's review is internal. An AO approval is not a formal GitHub or GitLab approval: it does not
 satisfy required or independent-account reviews or branch protection, and it
 does not authorize merging.
 
@@ -55,7 +55,42 @@ ao review ls mer-3
 
 ### ao review submit
 
-Record a reviewer's result for a worker's PR.
+Record a reviewer's result for a worker's PR. This records AO's local verdict;
+submission alone does not publish a provider review.
+
+GitLab reviewers publish directly through the project's available GitLab MCP
+operations or its already configured `glab` CLI. Suitable MCP operations are
+preferred; MCP absence alone does not block the project's `glab` route. The provider-specific instructions require the exact host, full subgroup
+project path, MR IID and reviewed head, and block changed heads or unrelated
+pending drafts. Required findings use positioned unresolved diff discussions:
+draft them with `gitlab_mr_draft_note_create`, then publish the verified batch
+once with `gitlab_mr_draft_note_publish_all`, its summary and `reviewer_state`.
+The equivalent `glab api` operations are GET of the MR, drafts, notes and
+discussions, then POST to `draft_notes` and `draft_notes/bulk_publish`. Use the
+explicit `--hostname` and URL-encoded full project path from the review task;
+pass JSON through stdin with `--input -`, and paginate every listing. See the
+[glab API command](https://docs.gitlab.com/cli/api/) and
+[GitLab draft notes API](https://docs.gitlab.com/api/draft_notes/) contracts.
+A review without findings still publishes its summary through that operation.
+GitLab's `reviewed` state is not a formal approval. GitHub keeps its direct
+`gh api` COMMENT review workflow, including in mixed-provider queues.
+
+Keep local verdict, provider publication and worker delivery separate in `body`.
+Leave `githubReviewId` and `--review-id` empty for new GitLab results. Select one
+project-supported route and account before any write. If the harness exposes
+neither route or permission is denied, report publication as blocked; do not
+install another CLI, change security settings or substitute a GitHub command.
+The instructions do not grant permissions or require an AO host server to access
+every project.
+
+After an uncertain write, stop POSTs and reconcile the same run/head marker
+through read-only draft, note and discussion listings. Never assume a timeout,
+5xx, malformed response or missing ID means nothing was published. Record an
+explicit publication error or unconfirmed status until the summary and complete
+batch are confirmed. The daemon only records the result; it adds no publisher or
+durable provider-attempt state. Existing SCM observation forwards actionable
+inline discussions when auto-inject is enabled. Summary publication alone does
+not prove observer polling or worker receipt.
 
 **Syntax:**
 ```
@@ -149,7 +184,7 @@ again: the command exits 1 with `REVIEW_ALREADY_RUNNING` or
 just pushed and it still says already reviewed, wait a few seconds and retry. The same reviewer agent never runs twice on one head at the same time.
 
 By default the command turns on the worker session's review auto-inject. The
-reviewer posts an inline GitHub comment for each change it requires, and AO
+reviewer posts an inline provider comment for each change it requires, and AO
 forwards those comments to the worker like any other review comments. An
 approval adds no comments, so check the verdict with `ao review ls`. If a run
 shows `failed` or `cancelled`, trigger again; nothing else reports it.

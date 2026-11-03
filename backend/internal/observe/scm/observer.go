@@ -460,6 +460,35 @@ func forcedFor(forced map[string]bool, pr domain.PullRequest) bool {
 	return forced[pr.URL] || (pr.HTMLURL != "" && forced[pr.HTMLURL])
 }
 
+// confirmedReviewRefreshes selects receipts that can change the native-note
+// delivery policy without changing provider content. The queued token alone is
+// not authority: validate it against the durable result and observed head.
+func (o *Observer) confirmedReviewRefreshes(ctx context.Context, requests []ports.ReviewRefreshRequest, worker domain.SessionID, pr ports.SCMPRObservation) ([]ports.ReviewRefreshRequest, error) {
+	reader, ok := o.store.(interface {
+		GetReviewRun(context.Context, string) (domain.ReviewRun, bool, error)
+	})
+	if !ok {
+		return nil, nil
+	}
+	var matched []ports.ReviewRefreshRequest
+	for _, request := range requests {
+		if request.WorkerID != worker || request.PRURL != pr.URL || request.TargetSHA == "" || request.TargetSHA != pr.HeadSHA {
+			continue
+		}
+		run, found, err := reader.GetReviewRun(ctx, request.RunID)
+		if err != nil {
+			o.RequestReviewRefresh(ctx, request)
+			return nil, err
+		}
+		if !found || run.SessionID != worker || run.PRURL != request.PRURL || run.TargetSHA != request.TargetSHA || !run.AutoInjectReview || !run.PublishedToProvider() ||
+			(run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered) {
+			continue
+		}
+		matched = append(matched, request)
+	}
+	return matched, nil
+}
+
 // Poll runs one synchronous SCM observation cycle.
 func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 	if o.traceEvents {
@@ -742,7 +771,18 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 			preserveLocalReviewDecision: reviewStale[key],
 		}
 		prepared := o.prepareForPersistence(obs, local, opts, now)
-		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
+		unchanged := !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review
+		var receiptRefreshes []ports.ReviewRefreshRequest
+		if unchanged && opts.reviewFetched && !reviewStale[key] && o.lifecycle != nil {
+			var err error
+			receiptRefreshes, err = o.confirmedReviewRefreshes(ctx, requests, subj.session.ID, prepared.PR)
+			if err != nil {
+				o.logger.Error("scm observer: review receipt lookup failed", "session", subj.session.ID, "err", err)
+				markRepoRefreshFailed(subj.repo)
+				continue
+			}
+		}
+		if unchanged && len(receiptRefreshes) == 0 {
 			reviewtrace.Emit(reviewtrace.ForTarget(ctx, string(subj.session.ID), subj.known.URL, subj.known.HTMLURL), "observation_commit", "unchanged")
 			prRefreshOK[key] = true
 			continue
@@ -770,6 +810,9 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 		targetCtx := reviewtrace.ForTarget(ctx, string(subj.session.ID), pr.URL, pr.HTMLURL, subj.known.URL, subj.known.HTMLURL)
 		if err := o.store.WriteSCMObservation(targetCtx, pr, checks, reviews, threads, comments, reviewMode); err != nil {
 			reviewtrace.Emit(targetCtx, "observation_commit", "failed")
+			for _, request := range receiptRefreshes {
+				o.RequestReviewRefresh(ctx, request)
+			}
 			o.logger.Error("scm observer: DB write failed", "session", subj.session.ID, "pr", pr.URL, "err", err)
 			markRepoRefreshFailed(subj.repo)
 			continue
@@ -788,6 +831,9 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 			cancel()
 			if err != nil {
 				reviewtrace.Emit(targetCtx, "lifecycle_finished", "failed")
+				for _, request := range receiptRefreshes {
+					o.RequestReviewRefresh(ctx, request)
+				}
 				o.logger.Error("scm observer: lifecycle notification failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
 				markRepoRefreshFailed(subj.repo)
 				continue

@@ -58,13 +58,6 @@ ao review ls mer-3
 Record a reviewer's result for a worker's PR. This records AO's local verdict;
 submission alone does not publish a provider review.
 
-Use `--publication-route auto|mcp|glab` to select reviewer instructions for one
-pass (default `auto`). Explicit `mcp` or `glab` requires one GitLab `--pr <URL>`;
-GitHub and untargeted batches keep `auto`. The selection is persisted and restored
-per run and task. An active run cannot switch routes. Forced routes stop as blocked
-when unavailable or denied and never fall back. This selects instructions, grants
-no permissions, and is not evidence of the transport actually used.
-
 GitLab reviewers publish directly through the project's available GitLab MCP
 operations or its already configured `glab` CLI. Suitable MCP operations are
 preferred; MCP absence alone does not block the project's `glab` route. The provider-specific instructions require the exact host, full subgroup
@@ -173,6 +166,13 @@ ao review cancel mer-3
 Start AO's reviewer on a worker's open PR heads (default: the calling session).
 Aliases: `execute`, `restart`. Reviewer panes cannot run it.
 
+Use `--publication-route auto|mcp|glab` to select reviewer instructions for one
+pass (default `auto`). Explicit `mcp` or `glab` requires one GitLab `--pr <URL>`;
+GitHub and untargeted batches keep `auto`. The selection is persisted and restored
+per run and task. An active run cannot switch routes. Forced routes stop as blocked
+when unavailable or denied and never fall back. This selects instructions, grants
+no permissions, and is not evidence of the transport actually used.
+
 **Syntax:**
 ```
 ao review trigger [worker-session-id] [flags]
@@ -184,6 +184,7 @@ ao review trigger [worker-session-id] [flags]
 |---|---|---|
 | `--session string` | Worker session id (or pass it positionally) | The calling AO session |
 | `--pr string` | Review only this session's implementation PR URL, attaching it to the session first if AO does not track it yet (never from another active session). Do not pass an external review target | Every eligible PR on the session |
+| `--publication-route string` | Reviewer publication instructions: `auto`, `mcp` or `glab`; explicit routes require one GitLab `--pr` | `auto` |
 | `--agent string` | Reviewer agent for this pass only (alias `--harness`) | Session reviewer, then project reviewer, then the project's default worker agent |
 | `--model string` | Reviewer model for this pass only | As above |
 | `--effort string` | Reviewer reasoning effort for this pass only | As above |

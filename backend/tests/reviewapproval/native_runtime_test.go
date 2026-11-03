@@ -158,6 +158,46 @@ func TestProbeRejectsCancelledRunOnDeferredSend(t *testing.T) {
 	require.ErrorContains(t, err, "running")
 }
 
+func TestProbeApprovalOptionalPermissionMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, commandSuffix, runSuffix string
+		wantError                             bool
+	}{
+		{name: "absent"},
+		{name: "both null", extra: `,"additionalPermissions":null,"networkApprovalContext":null`},
+		{name: "additional null", extra: `,"additionalPermissions":null`},
+		{name: "network null", extra: `,"networkApprovalContext":null`},
+		{name: "whitespace null", extra: ",\"additionalPermissions\": \n null ,\"networkApprovalContext\":\t null "},
+		{name: "additional object", extra: `,"additionalPermissions":{}`, wantError: true},
+		{name: "additional scalar", extra: `,"additionalPermissions":false`, wantError: true},
+		{name: "network object", extra: `,"networkApprovalContext":{"host":"example.test"}`, wantError: true},
+		{name: "network array", extra: `,"networkApprovalContext":[]`, wantError: true},
+		{name: "network scalar", extra: `,"networkApprovalContext":true`, wantError: true},
+		{name: "null string is authority", extra: `,"networkApprovalContext":"null"`, wantError: true},
+		{name: "null cannot permit another command", extra: `,"additionalPermissions":null`, commandSuffix: "; git status", wantError: true},
+		{name: "null cannot permit another scope", extra: `,"networkApprovalContext":null`, runSuffix: "-other", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scope := ports.ReviewerApprovalScope{ReviewID: "review", RunID: "run", WorkerID: "worker", PRURL: "https://gitlab.example/group/repo/-/merge_requests/1", TargetSHA: strings.Repeat("a", 40)}
+			snapshot := chatsvc.Snapshot{
+				ActiveBranch: domain.ConversationBranch{ProviderConversationID: "native-thread"},
+				Turns:        []domain.ConversationTurn{{ID: "local-turn", HandledByReviewID: scope.ReviewID, ProviderTurnID: "native-turn"}},
+			}
+			detail, err := json.Marshal(map[string]any{
+				"method": "item/commandExecution/requestApproval", "command": probeCommand(scope.RunID) + tc.commandSuffix,
+				"cwd": "/owned-workspace", "reviewerScope": scope,
+				"decisions": []map[string]string{{"id": "accept"}, {"id": "decline"}, {"id": "cancel"}},
+			})
+			require.NoError(t, err)
+			activity := domain.ConversationActivity{Kind: domain.ActivityKindApproval, Status: domain.ActivityStatusPending, RequestID: "review:epoch:" + scope.RunID + ":1", TurnID: "local-turn", Detail: []byte(string(detail[:len(detail)-1]) + tc.extra + "}")}
+			scope.RunID += tc.runSuffix
+
+			err = validateProbeApproval(snapshot, activity, scope, "/owned-workspace")
+			require.Equal(t, tc.wantError, err != nil)
+		})
+	}
+}
+
 func TestProbeApprovalRejectsExtraAuthorityOrDifferentCommand(t *testing.T) {
 	_, cfg := probeBindingFixture(t)
 	scope := *cfg.ReviewerApproval
@@ -721,7 +761,9 @@ func validateProbeApproval(snapshot chatsvc.Snapshot, activity domain.Conversati
 	if err := json.Unmarshal(activity.Detail, &detail); err != nil {
 		return err
 	}
-	if activity.Kind != domain.ActivityKindApproval || activity.Status != domain.ActivityStatusPending || detail.Method != "item/commandExecution/requestApproval" || detail.Command != probeCommand(scope.RunID) || detail.Cwd != workspace || detail.Scope != scope || len(detail.AdditionalPermissions) != 0 || len(detail.Network) != 0 || !strings.Contains(activity.RequestID, ":"+scope.RunID+":") {
+	additional := strings.TrimSpace(string(detail.AdditionalPermissions))
+	network := strings.TrimSpace(string(detail.Network))
+	if activity.Kind != domain.ActivityKindApproval || activity.Status != domain.ActivityStatusPending || detail.Method != "item/commandExecution/requestApproval" || detail.Command != probeCommand(scope.RunID) || detail.Cwd != workspace || detail.Scope != scope || (additional != "" && additional != "null") || (network != "" && network != "null") || !strings.Contains(activity.RequestID, ":"+scope.RunID+":") {
 		return errors.New("actual native pending request does not match the harmless once-only scope")
 	}
 	accept := false

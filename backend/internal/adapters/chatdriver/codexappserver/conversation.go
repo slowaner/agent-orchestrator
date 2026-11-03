@@ -146,6 +146,40 @@ func newConversation(proc *process, log *slog.Logger, providerScopeID string) *c
 	return c
 }
 
+// restoreActiveTurn recovers the surviving thread's current turn before start
+// releases replayed approval/input requests. A request's own turn ID is never
+// evidence that the turn is still active.
+func (c *conversation) restoreActiveTurn(ctx context.Context, threadID string) error {
+	var response codexproto.ThreadReadResponse
+	includeTurns := true
+	if err := c.conn.request(ctx, codexproto.MethodThreadRead, codexproto.ThreadReadParams{ThreadID: threadID, IncludeTurns: &includeTurns}, &response); err != nil {
+		return fmt.Errorf("read surviving reviewer turn: %w", err)
+	}
+	if response.Thread.ID != threadID {
+		return fmt.Errorf("surviving reviewer thread mismatch: got %q, want %q", response.Thread.ID, threadID)
+	}
+	active := ""
+	for _, turn := range response.Thread.Turns {
+		if turn.ID == "" {
+			return errors.New("surviving reviewer turn has no ID")
+		}
+		switch turn.Status {
+		case codexproto.TurnStatusInProgress:
+			if active != "" {
+				return errors.New("surviving reviewer thread has multiple active turns")
+			}
+			active = turn.ID
+		case codexproto.TurnStatusCompleted, codexproto.TurnStatusInterrupted, codexproto.TurnStatusFailed:
+		default:
+			return fmt.Errorf("unsupported surviving reviewer turn status %q", turn.Status)
+		}
+	}
+	c.mu.Lock()
+	c.activeTurn = active
+	c.mu.Unlock()
+	return nil
+}
+
 // start records the opened thread and begins translating notifications. It is
 // called once, after the thread is open, so no event is emitted for a
 // conversation the caller does not yet have a handle to.

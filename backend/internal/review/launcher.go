@@ -106,6 +106,8 @@ type LaunchResult struct {
 
 // ReviewerChatStart is the transport-neutral typed reviewer launch request.
 type ReviewerChatStart struct {
+	// ReviewerApproval binds human requests to this review run and full head.
+	// Nil grants no read-only approval authority; idle-only rebinding applies.
 	ReviewerApproval       *ports.ReviewerApprovalScope
 	BatchID                string
 	ReviewID               string

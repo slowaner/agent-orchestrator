@@ -9,80 +9,131 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestReviewerApprovalUsesInheritedPolicyOnStartResumeAndTurn(t *testing.T) {
+func TestReviewerApprovalUsesInheritedPolicyOnStartAndTurn(t *testing.T) {
 	for _, policy := range []string{`"on-request"`, `"never"`, `{"granular":{"mcp_elicitations":false,"rules":false,"sandbox_approval":false}}`} {
-		for _, resume := range []bool{false, true} {
-			t.Run(policy+map[bool]string{false: "/start", true: "/resume"}[resume], func(t *testing.T) {
-				d, srv := newTestDriver(t)
-				srv.respondTo("config/read", `{"config":{"approval_policy":`+policy+`}}`)
-				srv.respondTo("thread/start", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
-				srv.respondTo("thread/resume", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
-				var conv ports.ChatConversation
-				var err error
-				method := "thread/start"
-				if resume {
-					method = "thread/resume"
-					conv, err = d.Resume(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture(), ProviderConversationID: "thread-1"})
-				} else {
-					conv, err = d.Start(t.Context(), ports.ChatStartConfig{WorkspacePath: "/tmp/ws", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
-				}
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, conv.Close()) })
-				config := srv.awaitFrame(func(f frame) bool { return f.Method == "config/read" })
-				var configParams map[string]any
-				require.NoError(t, json.Unmarshal(config.Params, &configParams))
-				require.Equal(t, "/tmp/ws", configParams["cwd"])
-				opened := srv.awaitFrame(func(f frame) bool { return f.Method == method })
-				var params map[string]json.RawMessage
-				require.NoError(t, json.Unmarshal(opened.Params, &params))
-				require.JSONEq(t, policy, string(params["approvalPolicy"]))
-				require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
-				require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
-				_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeBypassPermissions}})
-				require.NoError(t, err)
-				turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
-				require.NoError(t, json.Unmarshal(turn.Params, &params))
-				require.JSONEq(t, policy, string(params["approvalPolicy"]))
-				require.JSONEq(t, `{"type":"readOnly","networkAccess":true}`, string(params["sandboxPolicy"]))
-				require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
-			})
-		}
+		t.Run(policy, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			srv.respondTo("config/read", `{"config":{"approval_policy":`+policy+`}}`)
+			srv.respondTo("thread/start", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
+			conv, err := d.Start(t.Context(), ports.ChatStartConfig{WorkspacePath: "/tmp/ws", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conv.Close()) })
+			config := srv.awaitFrame(func(f frame) bool { return f.Method == "config/read" })
+			var configParams map[string]any
+			require.NoError(t, json.Unmarshal(config.Params, &configParams))
+			require.Equal(t, "/tmp/ws", configParams["cwd"])
+			opened := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/start" })
+			var params map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(opened.Params, &params))
+			require.JSONEq(t, policy, string(params["approvalPolicy"]))
+			require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+
+			_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeBypassPermissions}})
+			require.NoError(t, err)
+			turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
+			params = nil
+			require.NoError(t, json.Unmarshal(turn.Params, &params))
+			require.JSONEq(t, policy, string(params["approvalPolicy"]))
+			require.JSONEq(t, `{"type":"readOnly","networkAccess":true}`, string(params["sandboxPolicy"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+		})
 	}
 }
 
-func TestReviewerApprovalMissingRawPolicyDefersToNativeStartResumeAndTurn(t *testing.T) {
+func TestReviewerApprovalUsesInheritedPolicyOnResumeAndTurn(t *testing.T) {
+	for _, policy := range []string{`"on-request"`, `"never"`, `{"granular":{"mcp_elicitations":false,"rules":false,"sandbox_approval":false}}`} {
+		t.Run(policy, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+			srv.respondTo("config/read", `{"config":{"approval_policy":`+policy+`}}`)
+			srv.respondTo("thread/resume", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
+			conv, err := d.Resume(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conv.Close()) })
+			config := srv.awaitFrame(func(f frame) bool { return f.Method == "config/read" })
+			var configParams map[string]any
+			require.NoError(t, json.Unmarshal(config.Params, &configParams))
+			require.Equal(t, "/tmp/ws", configParams["cwd"])
+			opened := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/resume" })
+			var params map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(opened.Params, &params))
+			require.JSONEq(t, policy, string(params["approvalPolicy"]))
+			require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+
+			_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeBypassPermissions}})
+			require.NoError(t, err)
+			turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
+			params = nil
+			require.NoError(t, json.Unmarshal(turn.Params, &params))
+			require.JSONEq(t, policy, string(params["approvalPolicy"]))
+			require.JSONEq(t, `{"type":"readOnly","networkAccess":true}`, string(params["sandboxPolicy"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+		})
+	}
+}
+
+func TestReviewerApprovalMissingRawPolicyDefersToNativeStartAndTurn(t *testing.T) {
 	for _, policy := range []string{`"on-request"`, `"never"`} {
-		for _, resume := range []bool{false, true} {
-			t.Run(policy+map[bool]string{false: "/start", true: "/resume"}[resume], func(t *testing.T) {
-				d, srv := newTestDriver(t)
-				method := "thread/start"
-				if resume {
-					method = "thread/resume"
-				}
-				srv.respondTo(method, `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
-				var conv ports.ChatConversation
-				var err error
-				if resume {
-					conv, err = d.Resume(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
-				} else {
-					conv, err = d.Start(t.Context(), ports.ChatStartConfig{WorkspacePath: "/tmp/ws", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
-				}
-				require.NoError(t, err)
-				t.Cleanup(func() { require.NoError(t, conv.Close()) })
-				opened := srv.awaitFrame(func(f frame) bool { return f.Method == method })
-				var params map[string]json.RawMessage
-				require.NoError(t, json.Unmarshal(opened.Params, &params))
-				require.NotContains(t, params, "approvalPolicy")
-				require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
-				_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeAuto}})
-				require.NoError(t, err)
-				turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
-				params = nil
-				require.NoError(t, json.Unmarshal(turn.Params, &params))
-				require.NotContains(t, params, "approvalPolicy")
-				require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
-			})
-		}
+		t.Run(policy, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+
+			srv.respondTo("thread/start", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
+			conv, err := d.Start(t.Context(), ports.ChatStartConfig{WorkspacePath: "/tmp/ws", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conv.Close()) })
+			config := srv.awaitFrame(func(f frame) bool { return f.Method == "config/read" })
+			var configParams map[string]any
+			require.NoError(t, json.Unmarshal(config.Params, &configParams))
+			require.Equal(t, "/tmp/ws", configParams["cwd"])
+			opened := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/start" })
+			var params map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(opened.Params, &params))
+			require.NotContains(t, params, "approvalPolicy")
+			require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+
+			_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeBypassPermissions}})
+			require.NoError(t, err)
+			turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
+			params = nil
+			require.NoError(t, json.Unmarshal(turn.Params, &params))
+			require.NotContains(t, params, "approvalPolicy")
+			require.JSONEq(t, `{"type":"readOnly","networkAccess":true}`, string(params["sandboxPolicy"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+		})
+	}
+}
+
+func TestReviewerApprovalMissingRawPolicyDefersToNativeResumeAndTurn(t *testing.T) {
+	for _, policy := range []string{`"on-request"`, `"never"`} {
+		t.Run(policy, func(t *testing.T) {
+			d, srv := newTestDriver(t)
+
+			srv.respondTo("thread/resume", `{"thread":{"id":"thread-1"},"approvalsReviewer":"user","sandbox":{"type":"readOnly","networkAccess":true},"approvalPolicy":`+policy+`}`)
+			conv, err := d.Resume(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conv.Close()) })
+			config := srv.awaitFrame(func(f frame) bool { return f.Method == "config/read" })
+			var configParams map[string]any
+			require.NoError(t, json.Unmarshal(config.Params, &configParams))
+			require.Equal(t, "/tmp/ws", configParams["cwd"])
+			opened := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/resume" })
+			var params map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(opened.Params, &params))
+			require.NotContains(t, params, "approvalPolicy")
+			require.JSONEq(t, `"read-only"`, string(params["sandbox"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+
+			_, err = conv.SendTurn(t.Context(), ports.ChatUserMessage{Text: "Review", Settings: ports.ChatTurnSettings{Approval: ports.PermissionModeBypassPermissions}})
+			require.NoError(t, err)
+			turn := srv.awaitFrame(func(f frame) bool { return f.Method == "turn/start" })
+			params = nil
+			require.NoError(t, json.Unmarshal(turn.Params, &params))
+			require.NotContains(t, params, "approvalPolicy")
+			require.JSONEq(t, `{"type":"readOnly","networkAccess":true}`, string(params["sandboxPolicy"]))
+			require.JSONEq(t, `"user"`, string(params["approvalsReviewer"]))
+		})
 	}
 }
 

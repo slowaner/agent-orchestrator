@@ -39,7 +39,9 @@ type ChatControllerStart struct {
 	Permissions   PermissionMode
 	// ReadOnly forces the provider's native sandbox to reject workspace writes.
 	// Reviewer-owned conversations set this independently of approval behavior.
-	ReadOnly              bool
+	ReadOnly bool
+	// ReviewerApproval carries the run/owner/target binding to the native
+	// conversation; it grants no permissions and can be rebound only when idle.
 	ReviewerApproval      *ReviewerApprovalScope
 	SystemPrompt          string
 	AdditionalDirectories []string

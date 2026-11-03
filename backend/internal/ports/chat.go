@@ -371,9 +371,12 @@ type ChatResumeConfig struct {
 	// Model is optional; empty keeps the provider conversation's current model.
 	Model string
 	// Effort is optional; empty keeps the provider conversation's current effort.
-	Effort           string
-	Permissions      PermissionMode
-	ReadOnly         bool
+	Effort      string
+	Permissions PermissionMode
+	ReadOnly    bool
+	// ReviewerApproval binds requests to one validated GitLab run without
+	// granting permissions. Nil leaves read-only permission requests denied;
+	// ordinary questions retain their existing validation.
 	ReviewerApproval *ReviewerApprovalScope
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.

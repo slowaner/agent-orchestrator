@@ -402,6 +402,12 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		// Neither the tier nor the collaboration mode the thread was left on is
 		// known; the next turn states both.
 		conv.tierUnknown, conv.planUnknown = true, true
+		if cfg.ReviewerApproval != nil {
+			if err := conv.restoreActiveTurn(ctx, cfg.ProviderConversationID); err != nil {
+				_ = conv.Close()
+				return nil, err
+			}
+		}
 		conv.start(cfg.ProviderConversationID, cfg.Model, cfg.Effort)
 		return conv, nil
 	}

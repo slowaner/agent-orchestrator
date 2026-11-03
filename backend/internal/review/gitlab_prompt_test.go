@@ -50,7 +50,7 @@ func TestReviewTextsGitLabUncertainWriteInstructions(t *testing.T) {
 	assert.Contains(t, prompt, "non-individual, resolvable, unresolved and positioned")
 	assert.Contains(t, prompt, "A summary alone does not reach the worker")
 	assert.Contains(t, prompt, "inherited permissions deny it")
-	assert.Contains(t, prompt, "do not change configuration or approvals")
+	assert.Contains(t, prompt, "do not change configuration or approval policy")
 }
 
 func TestReviewTextsMixedQueueKeepsProviderWorkflowsIsolated(t *testing.T) {

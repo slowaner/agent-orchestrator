@@ -1233,6 +1233,11 @@ func activityDetail(it threadItem) []byte {
 	}
 	if it.Error != nil && it.Error.Message != "" {
 		detail["error"] = it.Error.Message
+		if it.Type == itemMcpToolCall {
+			// Preserve the native cause independently of any later Code Mode
+			// result/store failure. Unknown tool errors never prove nonexecution.
+			detail["errorOutcome"] = nativeMCPErrorOutcome(it.Error.Message)
+		}
 	}
 	if it.Success != nil {
 		detail["success"] = *it.Success

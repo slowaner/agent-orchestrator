@@ -40,6 +40,7 @@ type ChatControllerStart struct {
 	// ReadOnly forces the provider's native sandbox to reject workspace writes.
 	// Reviewer-owned conversations set this independently of approval behavior.
 	ReadOnly              bool
+	ReviewerApproval      *ReviewerApprovalScope
 	SystemPrompt          string
 	AdditionalDirectories []string
 	MCPServers            []ChatMCPServerConfig

@@ -163,6 +163,8 @@ type Config struct {
 	AllowedOrigins []string
 	// Telemetry controls local/remote telemetry sinks.
 	Telemetry TelemetryConfig
+	// ReviewTrace enables local correlation logs only; it never enables cloud telemetry.
+	ReviewTrace bool
 	// HarnessUpdateChecks lets the daemon compare installed harnesses with their
 	// release sources over the network. AO_HARNESS_UPDATE_CHECKS=off disables
 	// it for offline or policy-restricted machines.
@@ -412,6 +414,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("invalid AO_HARNESS_UPDATE_INTERVAL %q: must be at least %s", raw, MinHarnessUpdateInterval)
 		}
 		cfg.HarnessUpdateInterval = d
+	}
+	if raw := os.Getenv("AO_REVIEW_TRACE"); raw != "" {
+		v, err := parseToggleEnv("AO_REVIEW_TRACE", raw)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ReviewTrace = v
 	}
 	if raw, present := os.LookupEnv("AO_TELEMETRY_EVENTS"); present && strings.TrimSpace(raw) != "" {
 		v, err := parseToggleEnv("AO_TELEMETRY_EVENTS", raw)

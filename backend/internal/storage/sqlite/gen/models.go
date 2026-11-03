@@ -662,6 +662,7 @@ type ReviewRun struct {
 	AutoInjectReview bool
 	TriggerSource    domain.ReviewTriggerSource
 	PublicationJson  string
+	PublicationRoute domain.ReviewPublicationRoute
 }
 
 type Session struct {

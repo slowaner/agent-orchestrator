@@ -1081,8 +1081,8 @@ func TestTriggerRequestedNamedPRAttachesItAndTargetsIt(t *testing.T) {
 
 type recordingReviewRefresher struct{ prURLs []string }
 
-func (r *recordingReviewRefresher) RequestReviewRefresh(prURL string) {
-	r.prURLs = append(r.prURLs, prURL)
+func (r *recordingReviewRefresher) RequestReviewRefresh(_ context.Context, request ports.ReviewRefreshRequest) {
+	r.prURLs = append(r.prURLs, request.PRURL)
 }
 
 func TestSubmitRequestsReviewRefreshForProviderPostedReview(t *testing.T) {

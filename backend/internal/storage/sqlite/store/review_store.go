@@ -244,6 +244,7 @@ func (s *Store) InsertReviewRun(ctx context.Context, r domain.ReviewRun) error {
 	}
 	err = s.qw.InsertReviewRun(ctx, gen.InsertReviewRunParams{
 		PublicationJson:  string(publicationJSON),
+		PublicationRoute: r.PublicationRoute.Normalized(),
 		ID:               r.ID,
 		ReviewID:         r.ReviewID,
 		SessionID:        r.SessionID,
@@ -539,6 +540,7 @@ func reviewRunFromRow(r gen.ReviewRun) (domain.ReviewRun, error) {
 		DeliveredAt:      deliveredAt,
 		AutoInjectReview: r.AutoInjectReview,
 		Publication:      publication,
+		PublicationRoute: r.PublicationRoute,
 	}, nil
 }
 

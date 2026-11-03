@@ -322,6 +322,9 @@ type ChatStartConfig struct {
 	// ReadOnly requires a provider-enforced sandbox that cannot modify the
 	// workspace. It is used for review-owned conversations.
 	ReadOnly bool
+	// ReviewerApproval requests human decisions under inherited native policy.
+	// Nil retains the existing noninteractive read-only behavior.
+	ReviewerApproval *ReviewerApprovalScope
 	// DisableNetwork requests tool network isolation for read-only background
 	// conversations. Supporting drivers must not inherit reviewer network access.
 	DisableNetwork bool
@@ -368,9 +371,10 @@ type ChatResumeConfig struct {
 	// Model is optional; empty keeps the provider conversation's current model.
 	Model string
 	// Effort is optional; empty keeps the provider conversation's current effort.
-	Effort      string
-	Permissions PermissionMode
-	ReadOnly    bool
+	Effort           string
+	Permissions      PermissionMode
+	ReadOnly         bool
+	ReviewerApproval *ReviewerApprovalScope
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string

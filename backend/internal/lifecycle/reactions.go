@@ -13,6 +13,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/deliverytelemetry"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reviewtrace"
 	"github.com/aoagents/agent-orchestrator/backend/internal/sessionguard"
 )
 
@@ -52,10 +53,11 @@ type reactionPayload struct {
 // conditions independent — none can suppress another — and centralizes the
 // send + dedup in a single loop.
 type pendingNudge struct {
-	key         string
-	sig         string
-	msg         string
-	maxAttempts int
+	key              string
+	sig              string
+	msg              string
+	maxAttempts      int
+	noteID, threadID string
 	// urgent routes the send through sessionguard.NudgeUrgent instead of
 	// Nudge: it still reaches a session idle at a needs-input prompt instead
 	// of being suppressed until the agent resumes. Reserved for the
@@ -220,7 +222,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 				}
 				// Per comment, like the review loop below: a shared key is a
 				// shared signature slot and a shared attempt budget.
-				nudges = append(nudges, pendingNudge{key: commentNudgeKey(o.URL, comment), sig: sig, msg: msg, maxAttempts: reviewMaxNudge})
+				nudges = append(nudges, pendingNudge{key: commentNudgeKey(o.URL, comment), sig: sig, msg: msg, maxAttempts: reviewMaxNudge, noteID: comment.ID, threadID: comment.ThreadID})
 			}
 		}
 
@@ -273,7 +275,7 @@ func (m *Manager) ApplyPRObservation(ctx context.Context, id domain.SessionID, o
 	// other deferred read errors.
 
 	for _, n := range nudges {
-		if _, err := m.sendOnce(ctx, id, o.URL, n.key, n.sig, n.msg, n.maxAttempts, n.urgent); err != nil {
+		if _, err := m.sendOnce(reviewtrace.WithComment(ctx, n.noteID, n.threadID), id, o.URL, n.key, n.sig, n.msg, n.maxAttempts, n.urgent); err != nil {
 			return err
 		}
 	}
@@ -937,6 +939,7 @@ const (
 
 func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key, sig, msg string, maxAttempts int, urgent bool) (sendOnceOutcome, error) {
 	if m.guard == nil {
+		reviewtrace.Emit(ctx, "worker_delivery", "unavailable")
 		return sendOnceAccounted, nil
 	}
 	m.react.mu.Lock()
@@ -944,16 +947,19 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 
 	if prURL != "" && !m.react.loaded[prURL] {
 		if err := m.loadPRSignaturesLocked(ctx, prURL); err != nil {
+			reviewtrace.Emit(ctx, "delivery_signature", "load_failed")
 			return sendOnceAccounted, err
 		}
 		m.react.loaded[prURL] = true
 	}
 
 	if m.react.seen[key] == sig {
+		reviewtrace.Emit(ctx, "worker_delivery", "deduplicated")
 		return sendOnceAccounted, nil
 	}
 	attempts := m.react.attempts[key]
 	if maxAttempts > 0 && attempts >= maxAttempts {
+		reviewtrace.Emit(ctx, "worker_delivery", "attempt_limit")
 		return sendOnceAccounted, nil
 	}
 	// The guard re-reads the session immediately before pasting: the caller's
@@ -979,14 +985,17 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 	}
 	outcome, err := nudge(ctx, id, msg)
 	if err != nil {
+		reviewtrace.Emit(ctx, "worker_delivery", "failed")
 		if outcome != sessionguard.Sent {
 			return sendOnceSuppressed, err
 		}
 		return sendOnceAccounted, err
 	}
 	if outcome != sessionguard.Sent {
+		reviewtrace.Emit(ctx, "worker_delivery", "suppressed")
 		return sendOnceSuppressed, nil
 	}
+	reviewtrace.Emit(ctx, "worker_delivery", "sent")
 	// Order: Send → in-memory mutation → durable persist. Sending first means a
 	// transient persist failure does NOT swallow a real send (the agent saw the
 	// message; subsequent polls in this process suppress re-sends via the
@@ -997,8 +1006,10 @@ func (m *Manager) sendOnce(ctx context.Context, id domain.SessionID, prURL, key,
 	m.react.attempts[key] = attempts + 1
 	if prURL != "" {
 		if err := m.persistPRSignaturesLocked(ctx, prURL); err != nil {
+			reviewtrace.Emit(ctx, "delivery_signature", "failed")
 			return sendOnceAccounted, err
 		}
+		reviewtrace.Emit(ctx, "delivery_signature", "persisted")
 	}
 	return sendOnceAccounted, nil
 }

@@ -19445,6 +19445,12 @@ components:
           type: string
         publication:
           $ref: '#/components/schemas/ReviewPublication'
+        publicationRoute:
+          enum:
+          - auto
+          - mcp
+          - glab
+          type: string
         reviewId:
           type: string
         sessionId:
@@ -21785,6 +21791,12 @@ components:
           description: Restrict the pass to this pull request, attaching it to the
             session first if AO does not track it yet (never from another active session).
             Omit to review every eligible PR on the session.
+          type: string
+        publicationRoute:
+          enum:
+          - auto
+          - mcp
+          - glab
           type: string
         rejectReviewedHead:
           description: Return 409 instead of reusing when every open PR head is already

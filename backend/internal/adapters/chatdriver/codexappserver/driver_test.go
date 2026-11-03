@@ -1268,12 +1268,47 @@ func TestBackgroundRefusesNetworkPermissionAndApprovalRequests(t *testing.T) {
 	} {
 		t.Run(method, func(t *testing.T) {
 			conv := &conversation{readOnly: true, disableNetwork: true}
-			result, err := conv.handleServerRequest(context.Background(), serverRequest{
+			result, err := conv.handleServerRequest(t.Context(), serverRequest{
 				Method: method, ID: json.RawMessage(`42`),
 				Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","permissions":{"network":{"enabled":true}},"availableDecisions":["accept","cancel"]}`),
 			})
 			if result != nil || err == nil || !strings.Contains(err.Error(), "does not permit") || len(conv.pending) != 0 {
 				t.Fatalf("background request = %#v, %v, pending = %#v", result, err, conv.pending)
+			}
+		})
+	}
+}
+
+func TestBackgroundRefusesMCPInputBeforeParsing(t *testing.T) {
+	validParams := json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"mcp_tool_call_approval_1","header":"MCP approval","question":"Allow the fixture tool?","options":[{"label":"Allow","description":"Allow once."},{"label":"Cancel","description":"Cancel."}]}]}`)
+	if _, _, err := parseUserInput(validParams); err != nil {
+		t.Fatalf("valid input fixture: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		params json.RawMessage
+		scope  *ports.ReviewerApprovalScope
+	}{
+		{name: "reserved input without scope", params: validParams},
+		{name: "malformed input without scope", params: json.RawMessage(`{`)},
+		{name: "reserved input with scope", params: validParams, scope: reviewerApprovalFixture()},
+		{name: "malformed input with scope", params: json.RawMessage(`{`), scope: reviewerApprovalFixture()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conv := &conversation{readOnly: true, disableNetwork: true}
+			conv.reviewerApproval.Store(tt.scope)
+
+			result, err := conv.handleServerRequest(t.Context(), serverRequest{
+				Method: codexproto.MethodItemToolRequestUserInput, ID: json.RawMessage(`42`), Params: tt.params,
+			})
+
+			if result != nil || err == nil || !strings.Contains(err.Error(), "background task does not permit") {
+				t.Fatalf("background input = %#v, %v", result, err)
+			}
+			if len(conv.pending) != 0 || len(conv.pendingInputs) != 0 {
+				t.Fatalf("background input parked an interaction: approvals=%d, inputs=%d", len(conv.pending), len(conv.pendingInputs))
 			}
 		})
 	}

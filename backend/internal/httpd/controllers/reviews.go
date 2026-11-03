@@ -201,6 +201,7 @@ func (c *ReviewsController) trigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := c.Svc.TriggerRequested(r.Context(), sessionID(r), reviewsvc.TriggerRequest{
+		PublicationRoute:   in.PublicationRoute,
 		Harness:            in.Harness,
 		Config:             in.AgentConfig,
 		Source:             domain.ReviewTriggerSource(strings.TrimSpace(in.Source)),

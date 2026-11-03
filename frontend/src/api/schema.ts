@@ -6858,6 +6858,8 @@ export interface components {
             id: string;
             prUrl: string;
             publication?: components["schemas"]["ReviewPublication"];
+            /** @enum {string} */
+            publicationRoute?: "auto" | "mcp" | "glab";
             reviewId: string;
             sessionId: string;
             status: string;
@@ -7774,6 +7776,8 @@ export interface components {
             interfaceMode?: "chat" | "tui";
             /** @description Restrict the pass to this pull request, attaching it to the session first if AO does not track it yet (never from another active session). Omit to review every eligible PR on the session. */
             prUrl?: string;
+            /** @enum {string} */
+            publicationRoute?: "auto" | "mcp" | "glab";
             /** @description Return 409 instead of reusing when every open PR head is already being reviewed or already has a review. */
             rejectReviewedHead?: boolean;
             /** @description Start a fresh pass for already-reviewed current heads; a different reviewer may run alongside one that is still running. A person's rerun reuses an active pass from the same reviewer; an agent's rerun returns 409 REVIEW_ALREADY_RUNNING instead. */

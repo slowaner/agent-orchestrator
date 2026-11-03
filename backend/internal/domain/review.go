@@ -86,6 +86,8 @@ type ReviewRun struct {
 	// Body is the review text the reviewer submitted. It is recorded for AO's
 	// own tracking; the reviewer also posts the review to the PR itself.
 	Body string `json:"body"`
+	// PublicationRoute selects instructions for this pass and survives restore.
+	PublicationRoute ReviewPublicationRoute `json:"publicationRoute,omitempty" enum:"auto,mcp,glab"`
 	// Publication records provider publication independently of the local verdict.
 	Publication *ReviewPublication `json:"publication,omitempty"`
 	// GithubReviewID is the id of the GitHub PR review the reviewer posted for

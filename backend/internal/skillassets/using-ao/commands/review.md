@@ -58,6 +58,13 @@ ao review ls mer-3
 Record a reviewer's result for a worker's PR. This records AO's local verdict;
 submission alone does not publish a provider review.
 
+Use `--publication-route auto|mcp|glab` to select reviewer instructions for one
+pass (default `auto`). Explicit `mcp` or `glab` requires one GitLab `--pr <URL>`;
+GitHub and untargeted batches keep `auto`. The selection is persisted and restored
+per run and task. An active run cannot switch routes. Forced routes stop as blocked
+when unavailable or denied and never fall back. This selects instructions, grants
+no permissions, and is not evidence of the transport actually used.
+
 GitLab reviewers publish directly through the project's available GitLab MCP
 operations or its already configured `glab` CLI. Suitable MCP operations are
 preferred; MCP absence alone does not block the project's `glab` route. The provider-specific instructions require the exact host, full subgroup

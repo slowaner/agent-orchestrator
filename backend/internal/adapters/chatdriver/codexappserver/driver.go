@@ -304,6 +304,10 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		return nil, errors.New("persistent chat host already owns a provider conversation for a fresh session")
 	}
 
+	if err := conv.configureReviewerApproval(ctx, cfg.ReviewerApproval, cfg.ReadOnly, cfg.DisableNetwork, cfg.WorkspacePath); err != nil {
+		_ = conv.Close()
+		return nil, err
+	}
 	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.disableNetwork = cfg.DisableNetwork
@@ -317,6 +321,7 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 	if cfg.Ephemeral {
 		params["ephemeral"] = true
 	}
+	conv.applyReviewerApproval(params)
 	if cfg.Model != "" {
 		params["model"] = cfg.Model
 	}
@@ -334,8 +339,11 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
-		Model           string `json:"model"`
-		ReasoningEffort string `json:"reasoningEffort"`
+		Model             string          `json:"model"`
+		ReasoningEffort   string          `json:"reasoningEffort"`
+		ApprovalPolicy    json.RawMessage `json:"approvalPolicy"`
+		ApprovalsReviewer string          `json:"approvalsReviewer"`
+		Sandbox           json.RawMessage `json:"sandbox"`
 	}
 	openCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
@@ -348,6 +356,10 @@ func (d *Driver) Start(ctx context.Context, cfg ports.ChatStartConfig) (ports.Ch
 		return nil, errors.New("thread/start returned no thread id")
 	}
 
+	if err := conv.recordReviewerPolicy(resp.ApprovalPolicy, resp.ApprovalsReviewer, resp.Sandbox, "thread/open"); err != nil {
+		_ = conv.Terminate()
+		return nil, err
+	}
 	conv.start(resp.Thread.ID, resp.Model, resp.ReasoningEffort)
 	return conv, nil
 }
@@ -378,6 +390,10 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return nil, err
 	}
 	if reconnected {
+		if err := conv.configureReviewerApproval(ctx, cfg.ReviewerApproval, cfg.ReadOnly, false, cfg.WorkspacePath); err != nil {
+			_ = conv.Close()
+			return nil, err
+		}
 		// The host preserved the already-initialized app-server connection and its
 		// loaded thread. Host replay bridges output and unresolved server requests
 		// across the daemon detach without waiting for the active turn to settle.
@@ -390,6 +406,10 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		return conv, nil
 	}
 
+	if err := conv.configureReviewerApproval(ctx, cfg.ReviewerApproval, cfg.ReadOnly, false, cfg.WorkspacePath); err != nil {
+		_ = conv.Close()
+		return nil, err
+	}
 	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.launchMode = cfg.Permissions
@@ -400,6 +420,7 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		"approvalsReviewer": reviewer,
 		"sandbox":           sandbox,
 	}
+	conv.applyReviewerApproval(params)
 	if cfg.Model != "" {
 		params["model"] = cfg.Model
 	}
@@ -418,9 +439,12 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	resumeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	var resp struct {
-		Model           string  `json:"model"`
-		ReasoningEffort string  `json:"reasoningEffort"`
-		ServiceTier     *string `json:"serviceTier"`
+		Model             string          `json:"model"`
+		ReasoningEffort   string          `json:"reasoningEffort"`
+		ApprovalPolicy    json.RawMessage `json:"approvalPolicy"`
+		ApprovalsReviewer string          `json:"approvalsReviewer"`
+		Sandbox           json.RawMessage `json:"sandbox"`
+		ServiceTier       *string         `json:"serviceTier"`
 	}
 	err = conv.conn.request(resumeCtx, "thread/resume", params, &resp)
 	if err != nil && cfg.FreshIfMissing && codexThreadMissing(err) {
@@ -431,8 +455,11 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 			Thread struct {
 				ID string `json:"id"`
 			} `json:"thread"`
-			Model           string `json:"model"`
-			ReasoningEffort string `json:"reasoningEffort"`
+			Model             string          `json:"model"`
+			ReasoningEffort   string          `json:"reasoningEffort"`
+			ApprovalPolicy    json.RawMessage `json:"approvalPolicy"`
+			ApprovalsReviewer string          `json:"approvalsReviewer"`
+			Sandbox           json.RawMessage `json:"sandbox"`
 		}
 		if err = conv.conn.request(resumeCtx, "thread/start", params, &started); err == nil && started.Thread.ID == "" {
 			err = errors.New("thread/start returned no thread id")
@@ -440,6 +467,10 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 		if err != nil {
 			_ = conv.Terminate()
 			return nil, fmt.Errorf("%w: start in place of a missing thread: %w", ports.ErrChatResumeFailed, err)
+		}
+		if err := conv.recordReviewerPolicy(started.ApprovalPolicy, started.ApprovalsReviewer, started.Sandbox, "thread/start"); err != nil {
+			_ = conv.Terminate()
+			return nil, err
 		}
 		conv.start(started.Thread.ID, started.Model, started.ReasoningEffort)
 		return conv, nil
@@ -457,6 +488,10 @@ func (d *Driver) Resume(ctx context.Context, cfg ports.ChatResumeConfig) (ports.
 	// thread/resume does not report the collaboration mode, and Plan sticks to
 	// the thread across a restart, so the next turn states it.
 	conv.planUnknown = true
+	if err := conv.recordReviewerPolicy(resp.ApprovalPolicy, resp.ApprovalsReviewer, resp.Sandbox, "thread/resume"); err != nil {
+		_ = conv.Terminate()
+		return nil, err
+	}
 	conv.start(cfg.ProviderConversationID, resp.Model, resp.ReasoningEffort)
 	return conv, nil
 }
@@ -711,6 +746,10 @@ func (c *conversation) SandboxAllowsNetwork(turnMode ports.PermissionMode) bool 
 		return false
 	}
 	if c.readOnly {
+		if c.reviewerApproval.Load() != nil {
+			_, network := reviewerSandboxNetwork(c.reviewerSandbox)
+			return network
+		}
 		return true
 	}
 	if turnMode == "" {
@@ -831,6 +870,10 @@ func (d *Driver) ForkIntoHost(ctx context.Context, sourceProviderConversationID,
 		_ = conv.Close()
 		return nil, errors.New("side provider host already owns a conversation")
 	}
+	if err := conv.configureReviewerApproval(ctx, cfg.ReviewerApproval, cfg.ReadOnly, cfg.DisableNetwork, cfg.WorkspacePath); err != nil {
+		_ = conv.Close()
+		return nil, err
+	}
 	policy, sandbox, reviewer := launchApprovalSettings(cfg.Permissions, cfg.ReadOnly)
 	conv.readOnly = cfg.ReadOnly
 	conv.disableNetwork = cfg.DisableNetwork
@@ -845,6 +888,7 @@ func (d *Driver) ForkIntoHost(ctx context.Context, sourceProviderConversationID,
 	params["lastTurnId"] = conv.nativeID(lastProviderTurnID)
 	// The child retains native context; copied turns are not needed in this response.
 	params["excludeTurns"] = true
+	conv.applyReviewerApproval(params)
 	if cfg.Model != "" {
 		params["model"] = cfg.Model
 	}
@@ -862,8 +906,11 @@ func (d *Driver) ForkIntoHost(ctx context.Context, sourceProviderConversationID,
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
-		Model           string `json:"model"`
-		ReasoningEffort string `json:"reasoningEffort"`
+		Model             string          `json:"model"`
+		ReasoningEffort   string          `json:"reasoningEffort"`
+		ApprovalPolicy    json.RawMessage `json:"approvalPolicy"`
+		ApprovalsReviewer string          `json:"approvalsReviewer"`
+		Sandbox           json.RawMessage `json:"sandbox"`
 	}
 	if err := conv.conn.request(openCtx, "thread/fork", params, &resp); err != nil {
 		_ = conv.Terminate()
@@ -878,6 +925,10 @@ func (d *Driver) ForkIntoHost(ctx context.Context, sourceProviderConversationID,
 			_ = conv.Terminate()
 			return nil, fmt.Errorf("record Codex fork: %w", err)
 		}
+	}
+	if err := conv.recordReviewerPolicy(resp.ApprovalPolicy, resp.ApprovalsReviewer, resp.Sandbox, "thread/open"); err != nil {
+		_ = conv.Terminate()
+		return nil, err
 	}
 	conv.start(resp.Thread.ID, resp.Model, resp.ReasoningEffort)
 	return conv, nil

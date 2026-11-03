@@ -94,6 +94,7 @@ func TestReviewPublicationRoundTripAndFeedbackPolicy(t *testing.T) {
 			assert.Equal(t, tc.wantPolicy, feedback[0].AutoInjectReview)
 
 			messenger := &publicationMessenger{}
+			messenger.Test(t)
 			messenger.On("Send", mock.Anything, session.ID, mock.MatchedBy(func(message string) bool {
 				return strings.Contains(message, tc.commentURL) && strings.Contains(message, "discussion-1") && strings.Contains(message, "main.go:7")
 			})).Return(nil)

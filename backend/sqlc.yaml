@@ -211,6 +211,10 @@ sql:
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
               type: "ReviewVerdict"
+          - column: "review_run.publication_route"
+            go_type:
+              import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"
+              type: "ReviewPublicationRoute"
           - column: "review_run.trigger_source"
             go_type:
               import: "github.com/aoagents/agent-orchestrator/backend/internal/domain"

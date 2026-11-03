@@ -26,13 +26,14 @@ func hasGitLabReview(spec LaunchSpec) bool {
 func providerReviewTexts(spec LaunchSpec) (string, string) {
 	tasks := spec.ReviewQueue
 	if len(tasks) == 0 {
-		tasks = []ports.ReviewTask{{RunID: spec.RunID, PRURL: spec.PRURL, TargetSHA: spec.TargetSHA}}
+		tasks = []ports.ReviewTask{{RunID: spec.RunID, PRURL: spec.PRURL, TargetSHA: spec.TargetSHA, PublicationRoute: spec.PublicationRoute}}
 	}
 	var prompt strings.Builder
 	prompt.WriteString("Review every queued task. Apply only the provider workflow in that task's section; never reuse another task's target, head, draft batch or provider IDs. Record every local verdict even when its provider publication is blocked.\n\n")
 	for _, task := range tasks {
 		one := spec
 		one.RunID, one.PRURL, one.TargetSHA = task.RunID, task.PRURL, task.TargetSHA
+		one.PublicationRoute = task.PublicationRoute.Normalized()
 		one.ReviewQueue = nil
 		provider := "GitHub"
 		var text string
@@ -48,6 +49,9 @@ func providerReviewTexts(spec LaunchSpec) (string, string) {
 }
 
 func gitLabReviewText(spec LaunchSpec) string {
+	if err := spec.PublicationRoute.ValidateTarget(spec.PRURL); err != nil {
+		return fmt.Sprintf("Provider publication is blocked: %s. Record the local verdict without provider writes.", err)
+	}
 	ref, err := domain.ParseChangeRequestURL(spec.PRURL)
 	if err != nil || ref.Provider != "gitlab" {
 		return fmt.Sprintf(`Review the queued task locally.
@@ -76,21 +80,41 @@ Use the actual changed line instead of the example new_line=1; for a deletion re
 		shellQuote(ref.Host), shellQuote(endpoint+"/draft_notes"),
 		shellQuote(ref.Host), shellQuote(endpoint+"/draft_notes/bulk_publish"))
 
+	routeIntro := "Publish directly from this reviewer using the project's existing GitLab MCP OR glab route. Prefer suitable MCP operations when the project exposes them; otherwise use its already configured glab route. Select one route and account before the first write, then keep it for this attempt. AO's daemon only records your local result; it does not publish it. Never use GitHub commands for this GitLab task."
+	routeStep := "For MCP, use the actual exposed tool names and schemas for gitlab_mr_get, gitlab_mr_draft_note_list, gitlab_mr_draft_note_create, gitlab_mr_draft_note_publish_all, gitlab_mr_notes_list and gitlab_mr_discussion_list on the server for this project. MCP absence alone does not block the existing glab route. Do not require one server to access every queued project. If neither project-supported route is available, this harness cannot execute it, or inherited permissions deny it, record the exact missing operation or permission in publicationError. Continue the local review and AO bookkeeping; do not change configuration or approval policy, bypass managed policy, install a CLI or use a host publication action. Do not route around a permission denial."
+	createOperation := "gitlab_mr_draft_note_create or the equivalent glab draft_notes POST"
+	publishOperation := "gitlab_mr_draft_note_publish_all or equivalent glab bulk_publish POST"
+	switch spec.PublicationRoute.Normalized() {
+	case domain.ReviewPublicationGlab:
+		routeIntro = "Selected publication route for this run: glab ONLY. This instruction does not grant permissions or prove observed transport. Use the existing project-supported glab account; do not call MCP publication operations or fall back to MCP. AO only records your result."
+		routeStep = "Before writes, verify the actual glab endpoint and authenticated account against this task's host/project and expected account. Use explicit --hostname and the fully encoded project path plus MR IID on every command; never rely on cwd/default host/remote. Check names of inherited route/auth overrides without printing secret values. An ambiguous or mismatched endpoint/account, unavailable command or denied permission BLOCKS this route. Do not alter auth/config/approval policy or unset restrictive settings to make it work. Never switch routes, retry writes or install tools."
+		createOperation = "the glab draft_notes POST below"
+		publishOperation = "the glab bulk_publish POST below"
+	case domain.ReviewPublicationMCP:
+		routeIntro = "Selected publication route for this run: MCP ONLY. This instruction does not grant permissions or prove observed transport. Use the existing project-supported GitLab MCP account; do not execute glab publication commands or fall back to glab. AO only records your result."
+		routeStep = "Use the actual exposed schemas for gitlab_mr_get, gitlab_mr_draft_note_list, gitlab_mr_draft_note_create, gitlab_mr_draft_note_publish_all, gitlab_mr_notes_list and gitlab_mr_discussion_list on the server for this project. Verify its account and exact host/project. An unavailable operation, denied permission or ambiguous account BLOCKS this route. Do not change servers/auth/config/approval policy, bypass policy or switch to glab."
+		createOperation = "gitlab_mr_draft_note_create"
+		publishOperation = "gitlab_mr_draft_note_publish_all"
+		glab = ""
+	}
+
 	return fmt.Sprintf(`Review the GitLab merge request owned by worker session %s.
 %s
-Publish directly from this reviewer using the project's existing GitLab MCP OR glab route. Prefer suitable MCP operations when the project exposes them; otherwise use its already configured glab route. Select one route and account before the first write, then keep it for this attempt. AO's daemon only records your local result; it does not publish it. Never use GitHub commands for this GitLab task.
+%s
 
-1. For MCP, use the actual exposed tool names and schemas for gitlab_mr_get, gitlab_mr_draft_note_list, gitlab_mr_draft_note_create, gitlab_mr_draft_note_publish_all, gitlab_mr_notes_list and gitlab_mr_discussion_list on the server for this project. MCP absence alone does not block the existing glab route. Do not require one server to access every queued project. If neither project-supported route is available, this harness cannot execute it, or inherited permissions deny it, record the exact missing operation or permission in publicationError. Continue the local review and AO bookkeeping; do not change configuration or approvals, bypass managed policy, install a CLI or use a host publication action. Do not route around a permission denial.
+1. %s
 
 2. Bind this run to the exact queue URL, full project path (including every subgroup), MR IID and reviewed head. Use that URL's host, including self-hosted GitLab. For MCP, pass the full URL-encoded project path or a project ID verified against that host and path. Get the MR, verify its returned web_url and IID match the requested URL and MR IID, require sha and diff_refs.head_sha to equal the queued target, and retain diff_refs.base_sha/head_sha/start_sha. A host/project/IID mismatch, missing diff refs or changed head blocks every write for this run.
 
 3. Use a stable marker in the summary: <!-- ao-review run=%s head=%s -->. Give each required finding the same marker plus a distinct finding number. First read all pages of pending drafts AND published notes/discussions. A marker from an earlier attempt requires read-only reconciliation, never another POST. Existing drafts not created and acknowledged in this current attempt block publication, including unrelated drafts by the same account. Do not publish, delete, edit or resolve those drafts.
 
-4. Every required change, including a design-level finding, must be a positioned unresolved diff discussion, not an ordinary note or summary alone. Stage it with gitlab_mr_draft_note_create or the equivalent glab draft_notes POST using position_type=text, base_sha/head_sha/start_sha from this MR, exact old_path/new_path and a positive new_line for additions or old_line for deletions; set resolve_discussion=false. Optional suggestions stay in the summary. Immediately before EACH write, get the MR again and require the same reviewed head. Capture each returned draft ID, body and position. Read all draft pages back and require exactly the acknowledged draft IDs, markers, bodies and positions from this attempt; any missing, changed or additional draft blocks the bulk write. Do not individually publish drafts.
+4. Every required change, including a design-level finding, must be a positioned unresolved diff discussion, not an ordinary note or summary alone. Stage it with %s using position_type=text, base_sha/head_sha/start_sha from this MR, exact old_path/new_path and a positive new_line for additions or old_line for deletions; set resolve_discussion=false. Optional suggestions stay in the summary. Immediately before EACH write, get the MR again and require the same reviewed head. Capture each returned draft ID, body and position. Read all draft pages back and require exactly the acknowledged draft IDs, markers, bodies and positions from this attempt; any missing, changed or additional draft blocks the bulk write. Do not individually publish drafts.
 
-5. Recheck the head and exact draft batch immediately before ONE gitlab_mr_draft_note_publish_all or equivalent glab bulk_publish POST. Include the full review summary and marker in note, and reviewer_state=reviewed for an approved local verdict or requested_changes for changes_requested. With no findings, still list drafts, require the empty batch and publish the summary this way. These reviewer states are not formal GitLab approvals. Never call approval or merge APIs.
+5. Recheck the head and exact draft batch immediately before ONE %s. Include the full review summary and marker in note, and reviewer_state=reviewed for an approved local verdict or requested_changes for changes_requested. With no findings, still list drafts, require the empty batch and publish the summary this way. These reviewer states are not formal GitLab approvals. Never call approval or merge APIs.
 
-6. A timeout, transport error, HTTP 5xx, undecodable response where JSON is required, missing draft ID or missing success confirmation is an UNCERTAIN publication outcome: the write may already have happened. Stop writes for this run. Do not repeat a POST or switch tools, even if a read currently shows nothing. Reconcile READ-ONLY with the same run/head marker: list all pending drafts, notes and discussions, and compare the findings and positions. GitLab can normalize note bodies when publishing, so preserve the stable markers and verify any normalized body still represents the exact finding. After an acknowledged bulk call, also read back the summary and every required discussion. Claim published only when that evidence confirms this run's complete batch and summary on the reviewed head. Otherwise record publicationError and status unconfirmed, preserving known draft/discussion IDs and errors. An empty draft list alone does not prove publication or failure.
+6. If native requests approval, wait for the human's normal approve-once decision for that exact operation; never self-approve, request a session/persistent grant, change approval policy or retry a denied write. A native denial explicitly reported BEFORE execution means publication is blocked (unless earlier writes remain uncertain). Preserve its exact original tool error. When using Code Mode/functions, never store an undefined value, Error instance or native result wrapper: capture only plain JSON primitives/objects after checking the result and catch failures as a plain object with message=String(error). A result-store/serialization error is secondary evidence, not the native cause or proof that a write did not execute. If the original tool error is unavailable or execution may have begun, record unconfirmed and reconcile read-only; never replace it with a guessed permission denial.
+
+A timeout, transport error, HTTP 5xx, undecodable response where JSON is required, missing draft ID or missing success confirmation is an UNCERTAIN publication outcome: the write may already have happened. Stop writes for this run. Do not repeat a POST or switch tools, even if a read currently shows nothing. Reconcile READ-ONLY with the same run/head marker: list all pending drafts, notes and discussions, and compare the findings and positions. GitLab can normalize note bodies when publishing, so preserve the stable markers and verify any normalized body still represents the exact finding. After an acknowledged bulk call, also read back the summary and every required discussion. Claim published only when that evidence confirms this run's complete batch and summary on the reviewed head. Otherwise record publicationError and status unconfirmed, preserving known draft/discussion IDs and errors. An empty draft list alone does not prove publication or failure.
 
 7. Verify required discussions are non-individual, resolvable, unresolved and positioned before claiming findings can reach the worker. AO's existing SCM observer forwards these inline findings when review auto-inject is enabled. A summary alone does not reach the worker. Provider readback is not proof of observer polling or worker receipt; keep local verdict, provider publication and worker delivery status separate. Do not claim worker receipt without evidence.
 
@@ -100,5 +124,5 @@ Record this run's local AO verdict and full review body even if publication was 
 Pass JSON on stdin, on one line, shell-escape single quotes and do not use a heredoc or write files into the checkout:
 
     printf '%%s' '{ "reviews": [ { "runId": "%s", "verdict": "<approved|changes_requested>", "body": "<full review and worker delivery status>", "publication": { "provider": "gitlab", "status": "<published|blocked|unconfirmed>", "prUrl": "<exact queued URL>", "targetSha": "<queued reviewed head>", "refs": [ { "kind": "<note|discussion|draft_note>", "id": "<real provider ID>" } ], "error": "<reason for blocked/unconfirmed; omit for published>" } } ] }' | ao review submit --session %s --reviews -
-`, spec.WorkerID, reviewQueueText(spec), spec.RunID, spec.TargetSHA, glab, spec.RunID, spec.WorkerID)
+`, spec.WorkerID, reviewQueueText(spec), routeIntro, routeStep, spec.RunID, spec.TargetSHA, createOperation, publishOperation, glab, spec.RunID, spec.WorkerID)
 }

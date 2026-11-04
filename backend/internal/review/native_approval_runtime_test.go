@@ -1,6 +1,4 @@
-//go:build e2e_test
-
-package reviewapproval
+package review_test
 
 import (
 	"context"
@@ -36,16 +34,16 @@ import (
 )
 
 var (
-	liveProbe = flag.Bool("reviewapproval.live", false, "run the separately authorized native approval scenario")
-	labRoot   = flag.String("reviewapproval.lab-root", "", "new private directory directly under the user's .ao/labs")
-	aoBinary  = flag.String("reviewapproval.ao-binary", "", "existing AO binary inside the owned lab directory")
+	liveProbe = flag.Bool("reviewapproval.live", false, "run the opt-in native approval test")
+	labRoot   = flag.String("reviewapproval.lab-root", "", "isolated runtime directory under .ao/labs")
+	aoBinary  = flag.String("reviewapproval.ao-binary", "", "AO executable inside the runtime directory")
 )
 
 // These are binding data, not HTTP request destinations. This scenario must
 // never invoke GitLab; its only permitted native command prints a run marker.
 const (
-	fixtureURL  = "https://gitlab.ptsecurity.com/nturchaninov/ao-testing/-/merge_requests/1"
-	fixtureHead = "3133da21de25c78fa622668ceb60177e04ee304e"
+	fixtureURL  = "https://gitlab.example.test/fixtures/review/-/merge_requests/1"
+	fixtureHead = "0123456789abcdef0123456789abcdef01234567"
 )
 
 func TestProbeChatOptionsAllocateConversationAndRejectUnavailableDriver(t *testing.T) {
@@ -265,11 +263,11 @@ func TestProbeHostConfigUsesProductionOwnerAndRawProtocol(t *testing.T) {
 
 func TestNativeReviewerCancelRestoreReplay(t *testing.T) {
 	if !*liveProbe {
-		t.Skip("native/model operations require a separately reserved live allocation")
+		t.Skip("enable native integration with -reviewapproval.live")
 	}
 	require.NoError(t, validateLabPaths(*labRoot, *aoBinary))
 	rootInfo, err := os.Stat(*labRoot)
-	require.NoError(t, err, "prepare only this lab's source/binary before the live allocation")
+	require.NoError(t, err, "runtime directory must already exist")
 	require.True(t, rootInfo.IsDir())
 	workspace := filepath.Join(*labRoot, "workspace")
 	require.NoError(t, os.Mkdir(workspace, 0o700), "never reuse an existing runtime workspace")
@@ -366,8 +364,8 @@ func TestNativeReviewerCancelRestoreReplay(t *testing.T) {
 	require.True(t, requestPending(afterReplay, currentRequest.RequestID), "stale replay must preserve the current human request")
 	require.Zero(t, completedProbeCommands(afterReplay, secondScope.RunID))
 
-	// Only the coordinator/human may resolve this actual current request. This
-	// server mounts the existing production resolver; the test never accepts it.
+	// A human resolves this exact request through the production resolver.
+	// The test never accepts it.
 	router := chi.NewRouter()
 	router.Route("/api/v1", func(r chi.Router) { (&controllers.ConversationsController{Svc: svc}).Register(r) })
 	server := httptest.NewServer(probeApprovalHandler(router, svc, secondScope, currentRequest.RequestID, workspace))
@@ -416,8 +414,8 @@ func probeBindingFixture(t *testing.T) (*sqlite.Store, review.ReviewerChatStart)
 func writeProbeTarget(ctx context.Context, st *sqlite.Store, workerID domain.SessionID, now time.Time) error {
 	return st.WriteSCMObservation(ctx, domain.PullRequest{
 		URL: fixtureURL, HTMLURL: fixtureURL, SessionID: workerID, Number: 1,
-		Provider: "gitlab", Host: "gitlab.ptsecurity.com", Repo: "nturchaninov/ao-testing",
-		ProviderID: "654310", HeadSHA: fixtureHead, Draft: true, UpdatedAt: now, ObservedAt: now,
+		Provider: "gitlab", Host: "gitlab.example.test", Repo: "fixtures/review",
+		ProviderID: "123", HeadSHA: fixtureHead, Draft: true, UpdatedAt: now, ObservedAt: now,
 	}, nil, nil, nil, nil, ports.ReviewWritePreserve)
 }
 

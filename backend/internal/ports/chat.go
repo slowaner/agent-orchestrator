@@ -322,6 +322,9 @@ type ChatStartConfig struct {
 	// ReadOnly requires a provider-enforced sandbox that cannot modify the
 	// workspace. It is used for review-owned conversations.
 	ReadOnly bool
+	// ReviewerApproval requests human decisions under inherited native policy.
+	// Nil retains the existing noninteractive read-only behavior.
+	ReviewerApproval *ReviewerApprovalScope
 	// DisableNetwork requests tool network isolation for read-only background
 	// conversations. Supporting drivers must not inherit reviewer network access.
 	DisableNetwork bool
@@ -371,6 +374,10 @@ type ChatResumeConfig struct {
 	Effort      string
 	Permissions PermissionMode
 	ReadOnly    bool
+	// ReviewerApproval binds requests to one validated GitLab run without
+	// granting permissions. Nil leaves read-only permission requests denied;
+	// ordinary questions retain their existing validation.
+	ReviewerApproval *ReviewerApprovalScope
 	// SystemPrompt is recomputed by the session manager on restore and reapplied
 	// to the provider process. It is not persisted in the conversation transcript.
 	SystemPrompt string

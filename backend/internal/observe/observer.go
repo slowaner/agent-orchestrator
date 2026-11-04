@@ -11,6 +11,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // StartPollLoop launches a goroutine that calls poll immediately, then on every
@@ -27,30 +29,46 @@ func StartPollLoop(ctx context.Context, tick time.Duration, poll func(context.Co
 	return StartTriggeredPollLoop(ctx, tick, nil, poll, logger, name)
 }
 
-// StartTriggeredPollLoop is StartPollLoop that also polls as soon as trigger
-// receives, so a caller that knows the provider just changed need not wait for
-// the next tick. A trigger arriving mid-poll runs one more poll right after it.
-// A nil trigger never fires.
+// PollDispatch identifies the scheduling event, independently of a forced target.
+type PollDispatch struct {
+	// ID uniquely identifies this poll across daemon restarts.
+	ID string
+	// Cause is startup, timer or trigger, as selected by the loop.
+	Cause string
+}
+
+// StartTriggeredPollLoop also polls when triggered. A trigger during a poll
+// schedules the next pass; a nil trigger never fires.
 func StartTriggeredPollLoop(ctx context.Context, tick time.Duration, trigger <-chan struct{}, poll func(context.Context) error, logger *slog.Logger, name string) <-chan struct{} {
+	return StartTriggeredPollLoopWithDispatch(ctx, tick, trigger, func(ctx context.Context, _ PollDispatch) error { return poll(ctx) }, logger, name)
+}
+
+// StartTriggeredPollLoopWithDispatch runs the same polling loop while exposing
+// its actual dispatch cause. A trigger during a poll schedules the next poll;
+// simultaneous timer/trigger readiness is reported according to select's choice.
+func StartTriggeredPollLoopWithDispatch(ctx context.Context, tick time.Duration, trigger <-chan struct{}, poll func(context.Context, PollDispatch) error, logger *slog.Logger, name string) <-chan struct{} {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		run := func(cause string) error { return poll(ctx, PollDispatch{ID: uuid.NewString(), Cause: cause}) }
+		if err := run("startup"); err != nil && !errors.Is(err, context.Canceled) {
 			logger.Error(name+": initial poll failed", "err", err)
 		}
 		t := time.NewTicker(tick)
 		defer t.Stop()
 		for {
+			cause := "timer"
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 			case <-trigger:
+				cause = "trigger"
 			}
-			if err := poll(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := run(cause); err != nil && !errors.Is(err, context.Canceled) {
 				logger.Error(name+": poll failed", "err", err)
 			}
 		}

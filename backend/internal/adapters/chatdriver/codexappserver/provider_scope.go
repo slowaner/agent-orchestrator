@@ -29,6 +29,12 @@ func (c *conversation) nativeID(id string) string {
 
 func (c *conversation) scopedEvent(event ports.ChatEvent) ports.ChatEvent {
 	event.NativeTurnID = event.ProviderTurnID
+	if event.RequestID != "" {
+		if event.ProviderItemID == event.RequestID {
+			event.ProviderItemID = c.reviewerRequestID(event.ProviderItemID)
+		}
+		event.RequestID = c.reviewerRequestID(event.RequestID)
+	}
 	if c.providerScopeID == "" {
 		return event
 	}

@@ -1157,6 +1157,14 @@ export type ReviewRun = {
 	verdict: "" | "approved" | "changes_requested";
 	body: string;
 	githubReviewId: string;
+	publication?: {
+		provider: "github" | "gitlab";
+		status: "published" | "blocked" | "unconfirmed";
+		prUrl: string;
+		targetSha: string;
+		refs?: { kind: "review" | "note" | "discussion" | "draft_note"; id: string }[];
+		error?: string;
+	};
 	createdAt: string;
 	deliveredAt?: string | null;
 	autoInjectReview: boolean;

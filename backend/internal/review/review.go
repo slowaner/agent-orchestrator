@@ -62,7 +62,7 @@ type Store interface {
 	ListReviewsBySession(ctx stdctx.Context, id domain.SessionID) ([]domain.Review, error)
 	ClearReviewerHandleByHarness(ctx stdctx.Context, id domain.SessionID, harness domain.ReviewerHarness) error
 	InsertReviewRun(ctx stdctx.Context, r domain.ReviewRun) error
-	UpdateReviewRunResult(ctx stdctx.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool) (bool, error)
+	UpdateReviewRunResult(ctx stdctx.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool, publication ...*domain.ReviewPublication) (bool, error)
 	UpdateReviewAgentSessionID(ctx stdctx.Context, id, agentSessionID string) (bool, error)
 	SupersedeStaleRunningReviewRuns(ctx stdctx.Context, sessionID domain.SessionID, prURL, targetSHA, body string) (int64, error)
 	CancelRunningReviewRunsBySession(ctx stdctx.Context, sessionID domain.SessionID, body string) (int64, error)
@@ -245,6 +245,8 @@ type RestoreReviewerResult struct {
 // TriggerOptions selects the reviewer, its surface, and the same-commit policy
 // for one trigger.
 type TriggerOptions struct {
+	// PublicationRoute selects instructions for one named GitLab MR.
+	PublicationRoute domain.ReviewPublicationRoute
 	// Harness and Config override the resolved reviewer for this pass only.
 	Harness domain.ReviewerHarness
 	Config  domain.AgentConfig
@@ -280,6 +282,9 @@ type TriggerOptions struct {
 // one session cannot change what any other session in the project runs. The
 // harness-change path below already handles the swap by respawning the pane.
 func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionID, opts TriggerOptions) (TriggerResult, error) {
+	if err := opts.PublicationRoute.ValidateTarget(opts.PRURL); err != nil {
+		return TriggerResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
 	override, overrideConfig, source, mode := opts.Harness, opts.Config, opts.Source, opts.InterfaceMode
 	if source == "" {
 		source = domain.ReviewTriggerManual
@@ -390,6 +395,18 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 	} else if !overrideConfig.IsZero() {
 		config = mergeReviewerAgentConfig(config, overrideConfig)
 		hasConfigOverride = config != resolvedConfig
+	}
+	// Never switch the instructions of an active pass that may already have written.
+	if opts.PublicationRoute.Normalized() != domain.ReviewPublicationAuto {
+		for _, run := range runs {
+			for _, pr := range prs {
+				if (run.PRURL == pr.URL || run.PRURL == pr.HTMLURL) && run.TargetSHA == pr.HeadSHA &&
+					run.Status == domain.ReviewRunRunning && (run.Harness == harness || run.Harness == "") &&
+					run.PublicationRoute.Normalized() != opts.PublicationRoute.Normalized() {
+					return TriggerResult{}, fmt.Errorf("%w: active review %s keeps publication route %s", ErrInvalid, run.ID, run.PublicationRoute.Normalized())
+				}
+			}
+		}
 	}
 	reviewRows, err := e.store.ListReviewsBySession(ctx, workerID)
 	if err != nil {
@@ -512,17 +529,18 @@ func (e *Engine) TriggerWithOptions(ctx stdctx.Context, workerID domain.SessionI
 			batchID = e.newID()
 		}
 		run := domain.ReviewRun{
-			ID:            e.newID(),
-			ReviewID:      reviewRow.ID,
-			SessionID:     workerID,
-			BatchID:       batchID,
-			Harness:       harness,
-			TriggerSource: source,
-			PRURL:         reviewState.PRURL,
-			TargetSHA:     reviewState.TargetSHA,
-			Status:        domain.ReviewRunRunning,
-			Verdict:       domain.VerdictNone,
-			CreatedAt:     now,
+			ID:               e.newID(),
+			ReviewID:         reviewRow.ID,
+			SessionID:        workerID,
+			BatchID:          batchID,
+			Harness:          harness,
+			TriggerSource:    source,
+			PublicationRoute: opts.PublicationRoute.Normalized(),
+			PRURL:            reviewState.PRURL,
+			TargetSHA:        reviewState.TargetSHA,
+			Status:           domain.ReviewRunRunning,
+			Verdict:          domain.VerdictNone,
+			CreatedAt:        now,
 			// Completion refreshes this snapshot before delivery. Keeping the
 			// trigger-time value also makes a running pass truthful in the API.
 			AutoInjectReview: worker.AutoInjectReview,
@@ -1410,21 +1428,22 @@ func reviewLaunchSpec(
 	launchID string,
 ) LaunchSpec {
 	return LaunchSpec{
-		RunID:           run.ID,
-		BatchID:         run.BatchID,
-		ReviewSessionID: run.ReviewID,
-		LaunchID:        launchID,
-		WorkerID:        worker.ID,
-		ProjectID:       worker.ProjectID,
-		Harness:         harness,
-		AgentConfig:     config,
-		WorkspacePath:   worker.Metadata.WorkspacePath,
-		AgentSessionID:  agentSessionID,
-		PreviousRuns:    nil,
-		PRURL:           run.PRURL,
-		TargetSHA:       run.TargetSHA,
-		ReviewQueue:     queue,
-		ReviewIndex:     index,
+		RunID:            run.ID,
+		BatchID:          run.BatchID,
+		ReviewSessionID:  run.ReviewID,
+		LaunchID:         launchID,
+		WorkerID:         worker.ID,
+		ProjectID:        worker.ProjectID,
+		Harness:          harness,
+		AgentConfig:      config,
+		WorkspacePath:    worker.Metadata.WorkspacePath,
+		AgentSessionID:   agentSessionID,
+		PreviousRuns:     nil,
+		PRURL:            run.PRURL,
+		TargetSHA:        run.TargetSHA,
+		PublicationRoute: run.PublicationRoute.Normalized(),
+		ReviewQueue:      queue,
+		ReviewIndex:      index,
 	}
 }
 
@@ -1432,9 +1451,10 @@ func reviewQueue(runs []domain.ReviewRun) []ports.ReviewTask {
 	queue := make([]ports.ReviewTask, 0, len(runs))
 	for _, run := range runs {
 		queue = append(queue, ports.ReviewTask{
-			RunID:     run.ID,
-			PRURL:     run.PRURL,
-			TargetSHA: run.TargetSHA,
+			RunID:            run.ID,
+			PRURL:            run.PRURL,
+			TargetSHA:        run.TargetSHA,
+			PublicationRoute: run.PublicationRoute.Normalized(),
 		})
 	}
 	return queue
@@ -1757,6 +1777,7 @@ func (e *Engine) Cancel(ctx stdctx.Context, workerID domain.SessionID) (CancelRe
 		run.Verdict = domain.VerdictNone
 		run.Body = "cancelled by user"
 		run.GithubReviewID = ""
+		run.Publication = nil
 		cancelled = append(cancelled, run)
 	}
 	prs, err := e.prs.ListPRsBySession(ctx, workerID)
@@ -1911,6 +1932,7 @@ func (e *Engine) terminateReviewer(ctx stdctx.Context, workerID domain.SessionID
 		run.Verdict = domain.VerdictNone
 		run.Body = body
 		run.GithubReviewID = ""
+		run.Publication = nil
 		cancelled = append(cancelled, run)
 	}
 	return TerminateResult{ReviewerHandleID: destroyedHandle, CancelledRuns: cancelled}, nil

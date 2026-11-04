@@ -341,6 +341,10 @@ const claudeAutoCompactWindowEnv = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 
 func cloneStartConfig(cfg StartConfig) StartConfig {
 	cloned := cfg
+	if cfg.ReviewerApproval != nil {
+		scope := *cfg.ReviewerApproval
+		cloned.ReviewerApproval = &scope
+	}
 	if cfg.AwakeReconnectTarget != nil {
 		target := *cfg.AwakeReconnectTarget
 		cloned.AwakeReconnectTarget = &target
@@ -407,6 +411,9 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 	owner := conversationOwner(cfg)
 	if owner.Kind == domain.ConversationOwnerReview {
 		cfg.ReadOnly = true
+	}
+	if err := s.validateReviewerApproval(ctx, owner, cfg.SessionID, cfg.ReviewerApproval); err != nil {
+		return nil, err
 	}
 	if target := cfg.AwakeReconnectTarget; target != nil {
 		s.mu.Lock()
@@ -503,6 +510,18 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 	s.mu.RUnlock()
 	if existing != nil && cfg.ProviderSwitch == nil {
 		if existing.State() != ports.ChatControllerStopped {
+			s.mu.RLock()
+			previous := s.startConfigs[owner]
+			s.mu.RUnlock()
+			if previous.ReviewerApproval != nil || cfg.ReviewerApproval != nil {
+				if err := rebindReviewerApproval(ctx, existing, previous.ReviewerApproval, cfg.ReviewerApproval); err != nil {
+					return nil, err
+				}
+				s.mu.Lock()
+				previous.ReviewerApproval = cfg.ReviewerApproval
+				s.startConfigs[owner] = cloneStartConfig(previous)
+				s.mu.Unlock()
+			}
 			return existing, nil
 		}
 		// A stopped event can reach the UI before the projector finishes its final
@@ -831,6 +850,7 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 			Effort:                 cfg.Effort,
 			Permissions:            cfg.Permissions,
 			ReadOnly:               cfg.ReadOnly,
+			ReviewerApproval:       cfg.ReviewerApproval,
 			SystemPrompt:           providerSystemPrompt,
 			ProviderScopeID:        providerScopeID,
 			ProviderIDsScoped:      providerBoundaryID != "" || activeBranch.ProviderIDsScoped,
@@ -849,6 +869,7 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 			Effort:                cfg.Effort,
 			Permissions:           cfg.Permissions,
 			ReadOnly:              cfg.ReadOnly,
+			ReviewerApproval:      cfg.ReviewerApproval,
 			SystemPrompt:          providerSystemPrompt,
 			ProviderScopeID:       providerScopeID,
 			AdditionalDirectories: cfg.AdditionalDirectories,
@@ -1579,6 +1600,9 @@ func (s *Service) Resolve(
 
 // ResolveForOwner resolves a pending approval for an owner-specific controller.
 func (s *Service) ResolveForOwner(ctx context.Context, owner domain.ConversationOwner, requestID string, decision ports.ChatDecision) error {
+	if err := s.validateCurrentReviewerApproval(ctx, owner, true); err != nil {
+		return err
+	}
 	controller, err := s.ControllerForOwner(owner)
 	if err != nil {
 		return err
@@ -1607,6 +1631,9 @@ func (s *Service) ResolveInput(
 
 // ResolveInputForOwner answers structured input for an owner-specific controller.
 func (s *Service) ResolveInputForOwner(ctx context.Context, owner domain.ConversationOwner, requestID string, response ports.ChatInputResponse) error {
+	if err := s.validateCurrentReviewerApproval(ctx, owner, false); err != nil {
+		return err
+	}
 	controller, err := s.ControllerForOwner(owner)
 	if err != nil {
 		return err

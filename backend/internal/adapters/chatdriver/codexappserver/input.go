@@ -123,6 +123,10 @@ func (c *conversation) requestUserInput(ctx context.Context, req serverRequest) 
 		c.mu.Unlock()
 		return nil, errConversationClosed
 	}
+	if c.reviewerApproval.Load() != nil && !c.reviewerRequestCurrent(parked.params.ThreadID, parked.params.TurnID) {
+		c.mu.Unlock()
+		return nil, errors.New("reviewer input request is not in the active thread/turn")
+	}
 	if c.pendingInputs[requestID] != nil || c.pending[requestID] != nil {
 		c.mu.Unlock()
 		return nil, errors.New("server request id is already pending")
@@ -171,14 +175,31 @@ func (c *conversation) ResolveInput(ctx context.Context, requestID string, respo
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	requestID = c.nativeID(requestID)
 	c.mu.Lock()
+	var valid bool
+	requestID, valid = c.nativeReviewerRequestID(c.nativeID(requestID))
+	if !valid {
+		c.mu.Unlock()
+		return ports.ErrChatRequestNotPending
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return errConversationClosed
 	}
 	parked := c.pendingInputs[requestID]
 	if parked == nil || parked.resolved {
+		c.mu.Unlock()
+		return ports.ErrChatRequestNotPending
+	}
+	if c.readOnly && c.reviewerApproval.Load() == nil {
+		for _, question := range parked.params.Questions {
+			if strings.HasPrefix(question.ID, "mcp_tool_call_approval_") {
+				c.mu.Unlock()
+				return ports.ErrChatRequestNotPending
+			}
+		}
+	}
+	if c.reviewerApproval.Load() != nil && !c.reviewerRequestCurrent(parked.params.ThreadID, parked.params.TurnID) {
 		c.mu.Unlock()
 		return ports.ErrChatRequestNotPending
 	}

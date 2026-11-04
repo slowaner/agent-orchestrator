@@ -140,9 +140,11 @@ type ReviewInvocation struct {
 
 // ReviewTask is one PR/run in a multi-PR review trigger queue.
 type ReviewTask struct {
-	RunID     string
-	PRURL     string
-	TargetSHA string
+	// PublicationRoute selects instructions for this task only.
+	PublicationRoute domain.ReviewPublicationRoute
+	RunID            string
+	PRURL            string
+	TargetSHA        string
 }
 
 // ReviewCommandSpec is how to launch a reviewer: the argv, any extra env, and

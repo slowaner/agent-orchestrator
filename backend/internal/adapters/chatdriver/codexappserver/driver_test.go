@@ -22,6 +22,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/stretchr/testify/require"
 )
 
 type fakePlugin struct {
@@ -283,6 +284,108 @@ func TestStartCompletesHandshakeAndOpensThread(t *testing.T) {
 	// Default permissions must match what AO already gives a Codex TUI session.
 	if params.ApprovalPolicy != "never" || params.Sandbox != "danger-full-access" {
 		t.Errorf("default posture = %q/%q, want never/danger-full-access", params.ApprovalPolicy, params.Sandbox)
+	}
+}
+
+func TestReconnectRestoresReplayedCommandApproval(t *testing.T) {
+	d, srv := reconnectedApprovalDriver(t, `{"id":"thread-1","turns":[{"id":"turn-1","status":"inProgress"}]}`,
+		`{"id":"replayed","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","command":"git status","availableDecisions":["accept","cancel"]}}`)
+	conv, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conv.Close()) })
+
+	event := nextEvent(t, conv.Events(), ports.ChatEventApprovalRequested)
+	require.Equal(t, "turn-1", event.ProviderTurnID)
+	require.NoError(t, conv.ResolveRequest(t.Context(), event.RequestID, ports.ChatDecision{ID: "accept"}))
+	reply := srv.awaitFrame(func(f frame) bool { return f.ID != nil && string(*f.ID) == `"replayed"` && f.Method == "" })
+	require.Nil(t, reply.Error)
+	require.JSONEq(t, `{"decision":"accept"}`, string(reply.Result))
+	require.ErrorIs(t, conv.ResolveRequest(t.Context(), event.RequestID, ports.ChatDecision{ID: "accept"}), ports.ErrChatRequestNotPending)
+	require.False(t, srv.sentMethod("thread/resume"))
+	require.False(t, srv.sentMethod("turn/start"))
+}
+
+func TestReconnectRestoresReplayedMCPApproval(t *testing.T) {
+	d, srv := reconnectedApprovalDriver(t, `{"id":"thread-1","turns":[{"id":"turn-1","status":"inProgress"}]}`,
+		`{"id":"replayed","method":"mcpServer/elicitation/request","params":{"threadId":"thread-1","turnId":"turn-1","serverName":"gitlab","mode":"form","message":"Approve?","_meta":{"codex_approval_kind":"mcp_tool_call"},"requestedSchema":{"type":"object","properties":{}}}}`)
+	conv, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conv.Close()) })
+
+	event := nextEvent(t, conv.Events(), ports.ChatEventApprovalRequested)
+	require.Equal(t, "turn-1", event.ProviderTurnID)
+	require.NoError(t, conv.ResolveRequest(t.Context(), event.RequestID, ports.ChatDecision{ID: "cancel"}))
+	reply := srv.awaitFrame(func(f frame) bool { return f.ID != nil && string(*f.ID) == `"replayed"` && f.Method == "" })
+	require.JSONEq(t, `{"action":"cancel","content":null}`, string(reply.Result))
+	require.False(t, srv.sentMethod("thread/resume"))
+	require.False(t, srv.sentMethod("turn/start"))
+}
+
+func TestReconnectRestoresReplayedQuestion(t *testing.T) {
+	d, srv := reconnectedApprovalDriver(t, `{"id":"thread-1","turns":[{"id":"turn-1","status":"inProgress"}]}`,
+		`{"id":"replayed","method":"item/tool/requestUserInput","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"question","questions":[{"id":"choice","header":"Choice","question":"Continue?","isOther":false,"isSecret":false,"options":[{"label":"Yes","description":"Continue"}]}]}}`)
+	conv, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conv.Close()) })
+
+	event := nextEvent(t, conv.Events(), ports.ChatEventInputRequested)
+	require.Equal(t, "turn-1", event.ProviderTurnID)
+	require.NoError(t, conv.(*conversation).ResolveInput(t.Context(), event.RequestID, ports.ChatInputResponse{Action: ports.ChatInputActionCancel}))
+	reply := srv.awaitFrame(func(f frame) bool { return f.ID != nil && string(*f.ID) == `"replayed"` && f.Method == "" })
+	require.Nil(t, reply.Error)
+	require.False(t, srv.sentMethod("thread/resume"))
+	require.False(t, srv.sentMethod("turn/start"))
+}
+
+func TestReconnectApprovalRejectsDecisionAfterTurnCompletion(t *testing.T) {
+	d, srv := reconnectedApprovalDriver(t, `{"id":"thread-1","turns":[{"id":"turn-1","status":"inProgress"}]}`,
+		`{"id":"replayed","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","command":"git status","availableDecisions":["accept","cancel"]}}`)
+	conv, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conv.Close()) })
+
+	event := nextEvent(t, conv.Events(), ports.ChatEventApprovalRequested)
+	srv.push(`{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"interrupted","items":[]}}}`)
+	nextEvent(t, conv.Events(), ports.ChatEventTurnCompleted)
+	require.ErrorIs(t, conv.ResolveRequest(t.Context(), event.RequestID, ports.ChatDecision{ID: "accept"}), ports.ErrChatRequestNotPending)
+	require.False(t, srv.sentMethod("turn/start"))
+}
+
+func TestReconnectRejectsInvalidNativeTurnSnapshot(t *testing.T) {
+	for _, tc := range []struct{ name, snapshot string }{
+		{"wrong thread", `{"id":"other","turns":[{"id":"turn-1","status":"inProgress"}]}`},
+		{"missing turn ID", `{"id":"thread-1","turns":[{"status":"inProgress"}]}`},
+		{"unknown turn status", `{"id":"thread-1","turns":[{"id":"turn-1","status":"unknown"}]}`},
+		{"multiple live turns", `{"id":"thread-1","turns":[{"id":"turn-1","status":"inProgress"},{"id":"turn-2","status":"inProgress"}]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, srv := reconnectedApprovalDriver(t, tc.snapshot, "")
+			_, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.Error(t, err)
+			require.False(t, srv.sentMethod("thread/resume"))
+			require.False(t, srv.sentMethod("turn/start"))
+		})
+	}
+}
+
+func TestReconnectRejectsReplayedInactiveApproval(t *testing.T) {
+	for _, tc := range []struct{ name, snapshot, requestTurn string }{
+		{"completed", `{"id":"thread-1","turns":[{"id":"turn-1","status":"completed"}]}`, "turn-1"},
+		{"interrupted", `{"id":"thread-1","turns":[{"id":"turn-1","status":"interrupted"}]}`, "turn-1"},
+		{"failed", `{"id":"thread-1","turns":[{"id":"turn-1","status":"failed"}]}`, "turn-1"},
+		{"missing", `{"id":"thread-1","turns":[]}`, "turn-1"},
+		{"different turn", `{"id":"thread-1","turns":[{"id":"turn-2","status":"inProgress"}]}`, "turn-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, srv := reconnectedApprovalDriver(t, tc.snapshot, `{"id":"replayed","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"`+tc.requestTurn+`","command":"git status","availableDecisions":["accept","cancel"]}}`)
+			conv, err := d.Reconnect(t.Context(), ports.ChatResumeConfig{WorkspacePath: "/tmp/ws", ProviderConversationID: "thread-1", ReadOnly: true, ReviewerApproval: reviewerApprovalFixture()})
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, conv.Close()) })
+
+			reply := srv.awaitFrame(func(f frame) bool { return f.ID != nil && string(*f.ID) == `"replayed"` && f.Method == "" })
+			require.NotNil(t, reply.Error)
+			require.False(t, srv.sentMethod("turn/start"))
+		})
 	}
 }
 
@@ -1268,12 +1371,47 @@ func TestBackgroundRefusesNetworkPermissionAndApprovalRequests(t *testing.T) {
 	} {
 		t.Run(method, func(t *testing.T) {
 			conv := &conversation{readOnly: true, disableNetwork: true}
-			result, err := conv.handleServerRequest(context.Background(), serverRequest{
+			result, err := conv.handleServerRequest(t.Context(), serverRequest{
 				Method: method, ID: json.RawMessage(`42`),
 				Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","permissions":{"network":{"enabled":true}},"availableDecisions":["accept","cancel"]}`),
 			})
 			if result != nil || err == nil || !strings.Contains(err.Error(), "does not permit") || len(conv.pending) != 0 {
 				t.Fatalf("background request = %#v, %v, pending = %#v", result, err, conv.pending)
+			}
+		})
+	}
+}
+
+func TestBackgroundRefusesMCPInputBeforeParsing(t *testing.T) {
+	validParams := json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","questions":[{"id":"mcp_tool_call_approval_1","header":"MCP approval","question":"Allow the fixture tool?","options":[{"label":"Allow","description":"Allow once."},{"label":"Cancel","description":"Cancel."}]}]}`)
+	if _, _, err := parseUserInput(validParams); err != nil {
+		t.Fatalf("valid input fixture: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		params json.RawMessage
+		scope  *ports.ReviewerApprovalScope
+	}{
+		{name: "reserved input without scope", params: validParams},
+		{name: "malformed input without scope", params: json.RawMessage(`{`)},
+		{name: "reserved input with scope", params: validParams, scope: reviewerApprovalFixture()},
+		{name: "malformed input with scope", params: json.RawMessage(`{`), scope: reviewerApprovalFixture()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conv := &conversation{readOnly: true, disableNetwork: true}
+			conv.reviewerApproval.Store(tt.scope)
+
+			result, err := conv.handleServerRequest(t.Context(), serverRequest{
+				Method: codexproto.MethodItemToolRequestUserInput, ID: json.RawMessage(`42`), Params: tt.params,
+			})
+
+			if result != nil || err == nil || !strings.Contains(err.Error(), "background task does not permit") {
+				t.Fatalf("background input = %#v, %v", result, err)
+			}
+			if len(conv.pending) != 0 || len(conv.pendingInputs) != 0 {
+				t.Fatalf("background input parked an interaction: approvals=%d, inputs=%d", len(conv.pending), len(conv.pendingInputs))
 			}
 		})
 	}
@@ -1863,4 +2001,20 @@ func TestCodexResumedThreadKeepsTheUsersConfiguredServiceTier(t *testing.T) {
 	if tier, ok := params["serviceTier"]; ok {
 		t.Fatalf("serviceTier = %s, want it left to the user's config", tier)
 	}
+}
+
+func reconnectedApprovalDriver(t *testing.T, snapshot, replay string) (*Driver, *scriptedServer) {
+	t.Helper()
+	d, srv := newTestDriver(t)
+	srv.replyError("initialize", -32600, "Already initialized")
+	srv.respondTo("config/read", `{"config":{"approval_policy":"on-request"}}`)
+	srv.respondTo("thread/read", `{"thread":`+snapshot+`}`)
+	proc, err := d.spawn(t.Context(), "codex", "/tmp/ws", nil)
+	require.NoError(t, err)
+	d.persistent = true
+	d.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		// The surviving host replays the unresolved request, not turn/started.
+		return &persistenthost.Transport{Stdin: proc.stdin, Stdout: io.MultiReader(strings.NewReader(replay+"\n"), proc.stdout), Reconnected: true, NextRequestID: 41}, nil
+	}
+	return d, srv
 }

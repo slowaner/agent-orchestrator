@@ -402,6 +402,9 @@ func startSession(ctx context.Context, cfg config.Config, runtime runtimeselect.
 			reviewsvc.WithReviewResolver(scmProvider),
 		)
 	}
+	if cfg.ReviewTrace {
+		reviewOpts = append(reviewOpts, reviewsvc.WithLocalReviewTrace(log))
+	}
 	reviewOpts = append(reviewOpts, reviewsvc.WithPRRefresher(reviewPRRefresher{sessions: sessionSvc}))
 	if reviewRefresher != nil {
 		reviewOpts = append(reviewOpts, reviewsvc.WithThreadRefresher(reviewRefresher))
@@ -759,7 +762,7 @@ func (c chatLauncher) startReviewChat(ctx context.Context, cfg reviewcore.Review
 		return "", err
 	}
 	owner := domain.ReviewConversationOwner(cfg.ReviewID)
-	started, err := c.svc.StartChat(ctx, chatsvc.StartConfig{Owner: owner, SessionID: cfg.WorkerID, ProjectID: cfg.ProjectID, Kind: domain.KindWorker, Harness: cfg.Harness, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: cfg.Env, Model: cfg.Model, Effort: cfg.Effort, Permissions: ports.PermissionModeAuto, SystemPrompt: cfg.SystemPrompt, ProviderConversationID: cfg.ProviderConversationID})
+	started, err := c.svc.StartChat(ctx, chatsvc.StartConfig{Owner: owner, SessionID: cfg.WorkerID, ProjectID: cfg.ProjectID, Kind: domain.KindWorker, Harness: cfg.Harness, DataDir: cfg.DataDir, WorkspacePath: cfg.WorkspacePath, Env: cfg.Env, Model: cfg.Model, Effort: cfg.Effort, Permissions: ports.PermissionModeAuto, SystemPrompt: cfg.SystemPrompt, ProviderConversationID: cfg.ProviderConversationID, ReviewerApproval: cfg.ReviewerApproval})
 	if err != nil {
 		return "", err
 	}

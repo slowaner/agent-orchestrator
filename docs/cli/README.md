@@ -233,6 +233,53 @@ PR actions are available through `ao pr merge` and
 `ao review trigger` (also `execute` and `restart`), `ao review cancel` (also
 `stop`), and `ao review submit`.
 
+`ao review trigger <worker> --pr <GitLab-MR-URL> --publication-route glab`
+selects reviewer instructions for that run. Values are `auto` (default), `mcp`,
+and `glab`; explicit routes require a single GitLab target. The persisted route
+survives restore and cannot be changed on an active pass. Unavailable or denied
+forced workflows report blocked without fallback. This never grants access or
+attests to the transport actually used.
+
+Native Codex chat can request human approval for a single validated GitLab run.
+AO keeps the default read-only sandbox and reuses the effective native approval
+policy for the reviewer's working directory. When raw config leaves the policy
+unspecified, AO omits its override and checks the native Start/Resume resolved
+policy, human reviewer and read-only sandbox. An inherited explicit `never` or
+managed denial stays blocking. Only approve-once and the native decline/cancel
+choices are exposed; no session/persistent grants or automatic decisions are
+made. Requests are checked against the review owner, running run, batch, worker,
+URL/head, native thread and active turn. Completed or mismatched requests cannot
+be resolved. GitHub, mixed queues and background conversations retain their
+existing approval behavior. Unknown MCP elicitation forms fail closed.
+
+The existing review conversation approval endpoint resolves a pending request;
+it does not publish a review. A known native denial before execution is blocked.
+A timeout or unknown result remains unconfirmed and requires read-only provider
+reconciliation. Native tool errors remain in activity detail independently of
+secondary Code Mode serialization/store errors; AO does not implement or replace
+the native Code Mode result store.
+
+For an isolated diagnostic daemon, opt in with `AO_REVIEW_TRACE=on` on that daemon's
+invocation. Structured `review trace` events use the daemon's local logger at Info,
+so no debug-level or cloud opt-in is needed. Join `run_id`, `worker_id`, hashed
+`target_key`, `reviewed_head_sha` and `poll_id`: receipt recorded after DB commit,
+refresh requested/bridged/enqueued, actual dispatch cause (`startup`, `timer`,
+`trigger`), forced target consumed/selected, provider fetch result, observation
+commit, lifecycle request, worker delivery and signature persistence/dedup.
+A timer poll may consume a forced request; `fetch_reason=forced` proves target
+selection separately from the dispatcher cause. Coalesced runs keep distinct
+request tokens; per-target events are also restricted to the worker. Bodies,
+commands, auth, target URLs and raw errors are excluded from these events.
+
+Trace is diagnostic and not a durable delivery queue. A crash between receipt
+commit and request enqueue leaves a visible gap when logs survive; restart uses
+normal polling rather than replaying the in-memory request. `worker_delivery=sent`
+means the messenger accepted delivery, not that the worker acknowledged it. A
+signature-persist failure after sending can permit a duplicate after restart;
+`deduplicated` and `suppressed` are not new deliveries. Trace proves neither
+reviewer transport nor live provider publication. Disable it by omitting the
+opt-in on the next isolated invocation; no installed settings need changing.
+
 ## Configuration
 
 The CLI and daemon share the same environment-driven config:

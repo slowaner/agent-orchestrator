@@ -913,6 +913,11 @@ func (p *Provider) FetchReviewThreads(ctx context.Context, ref ports.SCMPRRef) (
 			if j == 0 && n.Position != nil {
 				filePath = n.Position.NewPath
 				line = n.Position.NewLine
+				if line == 0 {
+					// Deleted-line discussions carry only the old-side anchor.
+					filePath = n.Position.OldPath
+					line = n.Position.OldLine
+				}
 			}
 			if j < reviewCommentLimitPerThread {
 				comments = append(comments, ports.SCMReviewCommentObservation{
@@ -1002,6 +1007,8 @@ type restNote struct {
 type restNotePosition struct {
 	NewPath string `json:"new_path"`
 	NewLine int    `json:"new_line"`
+	OldPath string `json:"old_path"`
+	OldLine int    `json:"old_line"`
 }
 
 func (n *restNote) noteURL(ref ports.SCMPRRef) string {

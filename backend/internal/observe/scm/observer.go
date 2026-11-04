@@ -23,6 +23,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	aoprocess "github.com/aoagents/agent-orchestrator/backend/internal/process"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reviewtrace"
 )
 
 const (
@@ -160,6 +161,8 @@ func defaultRateLimitCooldown(now time.Time) time.Duration {
 
 // Config holds optional observer knobs. Zero values use production defaults.
 type Config struct {
+	// TraceEvents enables local, secret-safe reviewer refresh correlation.
+	TraceEvents bool
 	// Tick is the fast PR/CI polling interval. Zero uses DefaultTickInterval.
 	Tick time.Duration
 	// ReviewInterval is the slower review-thread refresh interval.
@@ -265,7 +268,10 @@ type Observer struct {
 	// branchStates refreshes local branch facts on each tick.
 	branchStates BranchStateReconciler
 	// forceMu guards forcedReviews.
-	forceMu sync.Mutex
+	forceMu        sync.Mutex
+	traceEvents    bool
+	stopped        bool
+	forcedRequests map[string]map[string]ports.ReviewRefreshRequest
 	// forcedReviews holds PR URLs whose metadata and review threads the next
 	// poll fetches regardless of guards and review cadence. Each request is
 	// consumed by exactly one poll, whatever its outcome.
@@ -279,7 +285,7 @@ type Observer struct {
 // New constructs an Observer with default cadence/cache settings for zero
 // values in cfg.
 func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Observer {
-	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, scopedIdentityResolver: cfg.ScopedIdentityResolver, Cache: newCache(cfg.CacheMax), rateLimitUntil: map[string]time.Time{}, branchStates: cfg.BranchStates, lifecycleTimeout: DefaultLifecycleTimeout, forcedReviews: map[string]bool{}, trigger: make(chan struct{}, 1)}
+	o := &Observer{provider: provider, store: store, lifecycle: lifecycle, tick: cfg.Tick, reviewInterval: cfg.ReviewInterval, clock: cfg.Clock, logger: cfg.Logger, traceEvents: cfg.TraceEvents, scopedIdentityResolver: cfg.ScopedIdentityResolver, Cache: newCache(cfg.CacheMax), rateLimitUntil: map[string]time.Time{}, branchStates: cfg.BranchStates, lifecycleTimeout: DefaultLifecycleTimeout, forcedReviews: map[string]bool{}, trigger: make(chan struct{}, 1)}
 	if o.tick <= 0 {
 		o.tick = DefaultTickInterval
 	}
@@ -307,7 +313,12 @@ func New(provider Provider, store Store, lifecycle Lifecycle, cfg Config) *Obser
 // verdict is cached.
 func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 	var credentialGate sync.Once
-	poll := func(ctx context.Context) error {
+	if o.traceEvents {
+		ctx = reviewtrace.WithLogger(ctx, o.logger)
+	}
+	poll := func(ctx context.Context, dispatch observe.PollDispatch) error {
+		ctx = reviewtrace.WithPoll(ctx, dispatch.ID, dispatch.Cause)
+		reviewtrace.Emit(ctx, "poll_dispatched", dispatch.Cause)
 		credentialGate.Do(func() {
 			if _, err := o.checkCredentials(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				o.logger.Error("scm observer: initial credential check failed", "err", err)
@@ -315,7 +326,20 @@ func (o *Observer) Start(ctx context.Context) <-chan struct{} {
 		})
 		return o.Poll(ctx)
 	}
-	return observe.StartTriggeredPollLoop(ctx, o.tick, o.trigger, poll, o.logger, "scm observer")
+	loopDone := observe.StartTriggeredPollLoopWithDispatch(ctx, o.tick, o.trigger, poll, o.logger, "scm observer")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-loopDone
+		o.forceMu.Lock()
+		o.stopped = true
+		o.forceMu.Unlock()
+		_, requests := o.takeForcedReviews()
+		if len(requests) > 0 {
+			reviewtrace.Emit(reviewtrace.WithRequests(ctx, requests), "refresh_dropped", "cancelled")
+		}
+	}()
+	return done
 }
 
 type subject struct {
@@ -370,27 +394,65 @@ type persistenceOptions struct {
 // review submission). It does not wait: the refresh is one attempt through the
 // normal poll, its failures are logged there, and the regular cadence remains
 // the fallback.
-func (o *Observer) RequestReviewRefresh(prURL string) {
-	prURL = strings.TrimSpace(prURL)
-	if prURL == "" {
+func (o *Observer) RequestReviewRefresh(ctx context.Context, request ports.ReviewRefreshRequest) {
+	request.PRURL = strings.TrimSpace(request.PRURL)
+	ctx = reviewtrace.WithRequests(ctx, []ports.ReviewRefreshRequest{request})
+	if o.traceEvents {
+		ctx = reviewtrace.WithLogger(ctx, o.logger)
+	} else {
+		ctx = reviewtrace.WithLogger(ctx, nil)
+	}
+	if request.PRURL == "" || request.RunID == "" {
+		reviewtrace.Emit(ctx, "refresh_dropped", "invalid")
+		return
+	}
+	if ctx.Err() != nil {
+		reviewtrace.Emit(ctx, "refresh_dropped", "cancelled")
 		return
 	}
 	o.forceMu.Lock()
-	o.forcedReviews[prURL] = true
+	if o.stopped {
+		o.forceMu.Unlock()
+		reviewtrace.Emit(ctx, "refresh_dropped", "cancelled")
+		return
+	}
+	coalesced := o.forcedReviews[request.PRURL]
+	o.forcedReviews[request.PRURL] = true
+	if o.forcedRequests == nil {
+		o.forcedRequests = map[string]map[string]ports.ReviewRefreshRequest{}
+	}
+	if o.forcedRequests[request.PRURL] == nil {
+		o.forcedRequests[request.PRURL] = map[string]ports.ReviewRefreshRequest{}
+	}
+	o.forcedRequests[request.PRURL][request.RunID] = request
 	o.forceMu.Unlock()
+	outcome := "queued"
+	if coalesced {
+		outcome = "coalesced"
+	}
+	reviewtrace.Emit(ctx, "refresh_enqueued", outcome)
 	select {
 	case o.trigger <- struct{}{}:
+		reviewtrace.Emit(ctx, "refresh_wakeup", "queued")
 	default:
+		reviewtrace.Emit(ctx, "refresh_wakeup", "coalesced")
 	}
 }
 
-// takeForcedReviews returns and clears the pending forced refreshes.
-func (o *Observer) takeForcedReviews() map[string]bool {
+// takeForcedReviews atomically consumes target flags and all correlated tokens.
+func (o *Observer) takeForcedReviews() (map[string]bool, []ports.ReviewRefreshRequest) {
 	o.forceMu.Lock()
 	defer o.forceMu.Unlock()
 	forced := o.forcedReviews
+	var requests []ports.ReviewRefreshRequest
+	for _, target := range o.forcedRequests {
+		for _, request := range target {
+			requests = append(requests, request)
+		}
+	}
 	o.forcedReviews = map[string]bool{}
-	return forced
+	o.forcedRequests = nil
+	return forced, requests
 }
 
 // forcedFor reports whether a forced refresh names this tracked PR.
@@ -398,8 +460,50 @@ func forcedFor(forced map[string]bool, pr domain.PullRequest) bool {
 	return forced[pr.URL] || (pr.HTMLURL != "" && forced[pr.HTMLURL])
 }
 
+// confirmedReviewRefreshes selects receipts that can change the native-note
+// delivery policy without changing provider content. The queued token alone is
+// not authority: validate it against the durable result and observed head.
+func (o *Observer) confirmedReviewRefreshes(ctx context.Context, requests []ports.ReviewRefreshRequest, worker domain.SessionID, pr ports.SCMPRObservation) ([]ports.ReviewRefreshRequest, error) {
+	reader, ok := o.store.(interface {
+		GetReviewRun(context.Context, string) (domain.ReviewRun, bool, error)
+	})
+	if !ok {
+		return nil, nil
+	}
+	var matched []ports.ReviewRefreshRequest
+	for _, request := range requests {
+		if request.WorkerID != worker || request.PRURL != pr.URL || request.TargetSHA == "" || request.TargetSHA != pr.HeadSHA {
+			continue
+		}
+		run, found, err := reader.GetReviewRun(ctx, request.RunID)
+		if err != nil {
+			o.RequestReviewRefresh(ctx, request)
+			return nil, err
+		}
+		if !found || run.SessionID != worker || run.PRURL != request.PRURL || run.TargetSHA != request.TargetSHA || !run.AutoInjectReview || !run.PublishedToProvider() ||
+			(run.Status != domain.ReviewRunComplete && run.Status != domain.ReviewRunDelivered) {
+			continue
+		}
+		matched = append(matched, request)
+	}
+	return matched, nil
+}
+
 // Poll runs one synchronous SCM observation cycle.
 func (o *Observer) Poll(ctx context.Context) (pollErr error) {
+	if o.traceEvents {
+		ctx = reviewtrace.WithLogger(ctx, o.logger)
+	}
+	defer func() {
+		outcome := "ok"
+		if pollErr != nil {
+			outcome = "failed"
+		}
+		if ctx.Err() != nil {
+			outcome = "cancelled"
+		}
+		reviewtrace.Emit(ctx, "poll_finished", outcome)
+	}()
 	pollStarted := time.Now()
 	o.logger.Debug("scm observer: poll started", "started_at", pollStarted.UTC())
 	defer func() {
@@ -496,7 +600,23 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 		return err
 	}
 
-	forced := o.takeForcedReviews()
+	forced, requests := o.takeForcedReviews()
+	ctx = reviewtrace.WithRequests(ctx, requests)
+	if len(requests) > 0 {
+		reviewtrace.Emit(ctx, "forced_targets_consumed", "consumed")
+	}
+	for _, request := range requests {
+		matched := false
+		for _, subject := range subjects {
+			if request.WorkerID == subject.session.ID && (request.PRURL == subject.known.URL || request.PRURL == subject.known.HTMLURL) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			reviewtrace.Emit(reviewtrace.WithRequests(ctx, []ports.ReviewRefreshRequest{request}), "refresh_dropped", "untracked")
+		}
+	}
 	selection := o.selectRefreshCandidates(ctx, subjects, repoGuards, listedPRs, forced, markRepoRefreshFailed, now)
 	// Item 2 — terminal-state reconciliation for GitHub: tracked open PRs
 	// not in the current state=open listing may have transitioned to
@@ -651,7 +771,19 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 			preserveLocalReviewDecision: reviewStale[key],
 		}
 		prepared := o.prepareForPersistence(obs, local, opts, now)
-		if !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review {
+		unchanged := !prepared.Changed.Metadata && !prepared.Changed.CI && !prepared.Changed.Review
+		var receiptRefreshes []ports.ReviewRefreshRequest
+		if unchanged && opts.reviewFetched && !reviewStale[key] && o.lifecycle != nil {
+			var err error
+			receiptRefreshes, err = o.confirmedReviewRefreshes(ctx, requests, subj.session.ID, prepared.PR)
+			if err != nil {
+				o.logger.Error("scm observer: review receipt lookup failed", "session", subj.session.ID, "err", err)
+				markRepoRefreshFailed(subj.repo)
+				continue
+			}
+		}
+		if unchanged && len(receiptRefreshes) == 0 {
+			reviewtrace.Emit(reviewtrace.ForTarget(ctx, string(subj.session.ID), subj.known.URL, subj.known.HTMLURL), "observation_commit", "unchanged")
 			prRefreshOK[key] = true
 			continue
 		}
@@ -675,31 +807,45 @@ func (o *Observer) Poll(ctx context.Context) (pollErr error) {
 			}
 			pr, checks, reviews, threads, comments = domainFromObservation(subj.session.ID, subj.session, prepared, local, pendingOpts, now)
 		}
-		if err := o.store.WriteSCMObservation(ctx, pr, checks, reviews, threads, comments, reviewMode); err != nil {
+		targetCtx := reviewtrace.ForTarget(ctx, string(subj.session.ID), pr.URL, pr.HTMLURL, subj.known.URL, subj.known.HTMLURL)
+		if err := o.store.WriteSCMObservation(targetCtx, pr, checks, reviews, threads, comments, reviewMode); err != nil {
+			reviewtrace.Emit(targetCtx, "observation_commit", "failed")
+			for _, request := range receiptRefreshes {
+				o.RequestReviewRefresh(ctx, request)
+			}
 			o.logger.Error("scm observer: DB write failed", "session", subj.session.ID, "pr", pr.URL, "err", err)
 			markRepoRefreshFailed(subj.repo)
 			continue
 		}
+		reviewtrace.Emit(targetCtx, "observation_commit", "persisted", slog.Int("count", len(comments)))
 		if o.lifecycle != nil {
+			reviewtrace.Emit(targetCtx, "lifecycle_requested", "accepted")
 			// A merged or closed PR is not selected again after a failed
 			// reaction, so its one reaction (teardown, final notifications)
 			// runs unbounded. An open PR is retried on the next poll.
-			lifecycleCtx, cancel := ctx, context.CancelFunc(func() {})
+			lifecycleCtx, cancel := targetCtx, context.CancelFunc(func() {})
 			if !prepared.PR.Merged && !prepared.PR.Closed {
-				lifecycleCtx, cancel = context.WithTimeout(ctx, o.lifecycleTimeout)
+				lifecycleCtx, cancel = context.WithTimeout(targetCtx, o.lifecycleTimeout)
 			}
 			err := o.lifecycle.ApplySCMObservation(lifecycleCtx, subj.session.ID, prepared)
 			cancel()
 			if err != nil {
+				reviewtrace.Emit(targetCtx, "lifecycle_finished", "failed")
+				for _, request := range receiptRefreshes {
+					o.RequestReviewRefresh(ctx, request)
+				}
 				o.logger.Error("scm observer: lifecycle notification failed", "session", subj.session.ID, "pr", firstNonEmpty(prepared.PR.URL, prepared.PR.HTMLURL, local.URL), "err", err)
 				markRepoRefreshFailed(subj.repo)
 				continue
 			}
-			if err := o.store.WriteSCMObservation(ctx, finalPR, finalChecks, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+			reviewtrace.Emit(targetCtx, "lifecycle_finished", "ok")
+			if err := o.store.WriteSCMObservation(targetCtx, finalPR, finalChecks, nil, nil, nil, ports.ReviewWritePreserve); err != nil {
+				reviewtrace.Emit(targetCtx, "lifecycle_acknowledgement", "failed")
 				o.logger.Error("scm observer: DB lifecycle acknowledgement failed", "session", subj.session.ID, "pr", finalPR.URL, "err", err)
 				markRepoRefreshFailed(subj.repo)
 				continue
 			}
+			reviewtrace.Emit(targetCtx, "lifecycle_acknowledgement", "persisted")
 		}
 		// If this observation came from terminal reconciliation, a successful
 		// terminal persistence (merged/closed transition observed and
@@ -1732,6 +1878,9 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		}
 		pkey := keyForTrackedPR(s.known, s.repo)
 		obs, hasObs := observations[pkey]
+		if forcedFor(forced, s.known) {
+			reviewtrace.Emit(reviewtrace.ForTarget(ctx, string(s.session.ID), s.known.URL, s.known.HTMLURL), "forced_target_selected", "selected")
+		}
 		decision := string(s.known.Review)
 		if hasObs && obs.Review.Decision != "" {
 			decision = obs.Review.Decision
@@ -1743,11 +1892,29 @@ func (o *Observer) refreshReviews(ctx context.Context, subjects map[string]*subj
 		// A rate-limited provider gets no calls until its cooldown ends, a forced
 		// refresh included; the regular poll fetches the threads afterwards.
 		if o.inRateLimitCooldown(now, s.repo.Provider) {
+			reviewtrace.Emit(reviewtrace.ForTarget(ctx, string(s.session.ID), s.known.URL, s.known.HTMLURL), "provider_fetch", "deferred_cooldown")
 			continue
 		}
+		targetCtx := reviewtrace.ForTarget(ctx, string(s.session.ID), s.known.URL, s.known.HTMLURL)
+		reviewtrace.Emit(targetCtx, "provider_fetch", "started", slog.String("stage", "review_threads"))
+		fetchReason := "periodic"
+		if forcedFor(forced, s.known) {
+			fetchReason = "forced"
+		}
 		started := time.Now()
-		review, err := o.provider.FetchReviewThreads(ctx, ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL})
+		review, err := o.provider.FetchReviewThreads(targetCtx, ports.SCMPRRef{Repo: s.repo, Number: s.known.Number, URL: s.known.URL})
 		o.logProviderRequest("fetch_review_threads", repoFullName(s.repo), started, err)
+		outcome := "ok"
+		if err != nil {
+			outcome = "failed"
+		}
+		if targetCtx.Err() != nil {
+			outcome = "cancelled"
+		}
+		if err == nil && review.Partial {
+			outcome = "partial"
+		}
+		reviewtrace.Emit(targetCtx, "provider_fetch", outcome, slog.String("fetch_reason", fetchReason), slog.String("stage", "review_threads"), slog.Int64("duration_ms", time.Since(started).Milliseconds()), slog.String("observed_head_sha", obs.PR.HeadSHA))
 		if err != nil {
 			o.logger.Error("scm observer: review refresh failed", "pr", s.known.URL, "err", err)
 			o.cacheSetBool(o.Cache.ReviewRefreshFailed, &o.Cache.reviewFailedOrder, pkey, true)

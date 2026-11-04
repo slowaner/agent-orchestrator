@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"reflect"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/reqid"
 	reviewcore "github.com/aoagents/agent-orchestrator/backend/internal/review"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reviewtrace"
 	"github.com/aoagents/agent-orchestrator/backend/internal/telemetrymeta"
 )
 
@@ -92,6 +94,7 @@ type Service struct {
 	notifications      reviewNotificationSink
 	prRefresher        PRRefresher
 	reviewRefresher    ThreadRefresher
+	traceLogger        *slog.Logger
 	// engineTrigger indirects the engine's source-tagged trigger so the
 	// instrumented path can be exercised without standing up a full engine and
 	// its eighteen-method store. Defaulted in New; only tests replace it.
@@ -118,7 +121,7 @@ type Store interface {
 	GetReviewRun(ctx context.Context, id string) (domain.ReviewRun, bool, error)
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
 	SetSessionAutoInjectReview(ctx context.Context, id domain.SessionID, autoInject bool, updatedAt time.Time) (bool, error)
-	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool) (bool, error)
+	UpdateReviewRunResult(ctx context.Context, id string, status domain.ReviewRunStatus, verdict domain.ReviewVerdict, body, githubReviewID string, autoInjectReview bool, publication ...*domain.ReviewPublication) (bool, error)
 	ListPRsBySession(ctx context.Context, id domain.SessionID) ([]domain.PullRequest, error)
 	ListPRReviews(ctx context.Context, prURL string) ([]domain.PullRequestReview, error)
 	ListPRComments(ctx context.Context, prURL string) ([]domain.PullRequestComment, error)
@@ -165,7 +168,7 @@ func WithPRRefresher(r PRRefresher) Option {
 // ThreadRefresher asks SCM observation to read one PR's review threads now
 // rather than on its next scheduled poll. It must not block.
 type ThreadRefresher interface {
-	RequestReviewRefresh(prURL string)
+	RequestReviewRefresh(ctx context.Context, request ports.ReviewRefreshRequest)
 }
 
 // WithThreadRefresher refreshes a PR's review threads as soon as an AO review
@@ -173,6 +176,11 @@ type ThreadRefresher interface {
 // without waiting for the poller to notice them.
 func WithThreadRefresher(r ThreadRefresher) Option {
 	return func(s *Service) { s.reviewRefresher = r }
+}
+
+// WithLocalReviewTrace enables local structured correlation without a telemetry exporter.
+func WithLocalReviewTrace(logger *slog.Logger) Option {
+	return func(s *Service) { s.traceLogger = logger }
 }
 
 // WithClock overrides the service clock for tests.
@@ -457,8 +465,10 @@ func (s *Service) ResolveReviewComment(ctx context.Context, workerID domain.Sess
 // TriggerRequest is a client-requested review pass with its same-commit and
 // feedback policy.
 type TriggerRequest struct {
-	Harness domain.ReviewerHarness
-	Config  domain.AgentConfig
+	// PublicationRoute selects one run's instructions, without granting access.
+	PublicationRoute domain.ReviewPublicationRoute
+	Harness          domain.ReviewerHarness
+	Config           domain.AgentConfig
 	// Source is manual (a person) or agent (an AO session through the CLI).
 	// Automatic passes come only from the daemon through TriggerAuto.
 	Source        domain.ReviewTriggerSource
@@ -482,6 +492,9 @@ type TriggerOutcome struct {
 
 // TriggerRequested starts a client-requested review pass.
 func (s *Service) TriggerRequested(ctx context.Context, workerID domain.SessionID, req TriggerRequest) (TriggerOutcome, error) {
+	if err := req.PublicationRoute.ValidateTarget(strings.TrimSpace(req.PRURL)); err != nil {
+		return TriggerOutcome{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
 	source := req.Source
 	if source == "" {
 		source = domain.ReviewTriggerManual
@@ -501,6 +514,7 @@ func (s *Service) TriggerRequested(ctx context.Context, workerID domain.SessionI
 	}
 	result, err := s.triggerWithOptions(ctx, workerID, reviewcore.TriggerOptions{
 		Harness:                 req.Harness,
+		PublicationRoute:        req.PublicationRoute.Normalized(),
 		Config:                  req.Config,
 		Source:                  source,
 		InterfaceMode:           req.InterfaceMode,
@@ -818,6 +832,8 @@ type SubmittedReview struct {
 	Verdict        domain.ReviewVerdict
 	Body           string
 	GithubReviewID string
+	// Publication is the reviewer's target-bound provider receipt, if available.
+	Publication *domain.ReviewPublication
 }
 
 // Submit records a reviewer's result for a specific worker review pass.
@@ -880,6 +896,7 @@ func (s *Service) SubmitMany(ctx context.Context, workerID domain.SessionID, rev
 }
 
 func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, review SubmittedReview) (domain.ReviewRun, error) {
+	ctx = reviewtrace.WithLogger(ctx, s.traceLogger)
 	runID := review.RunID
 	verdict := review.Verdict
 	body := review.Body
@@ -903,9 +920,16 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 	if run.SessionID != workerID {
 		return domain.ReviewRun{}, fmt.Errorf("%w: review run %q does not belong to worker %q", ErrInvalid, runID, workerID)
 	}
-
 	switch run.Status {
 	case domain.ReviewRunRunning:
+		if providerFromPRURL(run.PRURL) == "gitlab" && githubReviewID != "" {
+			return domain.ReviewRun{}, fmt.Errorf("%w: GitLab publication must not use a GitHub review id; supply a structured publication receipt instead", ErrInvalid)
+		}
+		publication, reviewID, err := validatePublication(run, review)
+		if err != nil {
+			return domain.ReviewRun{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+		githubReviewID = reviewID
 		session, found, err := s.store.GetSession(ctx, workerID)
 		if err != nil {
 			return domain.ReviewRun{}, err
@@ -913,7 +937,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		if !found {
 			return domain.ReviewRun{}, fmt.Errorf("%w: worker session %q", ErrNotFound, workerID)
 		}
-		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID, session.AutoInjectReview)
+		updated, err := s.store.UpdateReviewRunResult(ctx, run.ID, domain.ReviewRunComplete, verdict, body, githubReviewID, session.AutoInjectReview, publication)
 		if err != nil {
 			return domain.ReviewRun{}, err
 		}
@@ -924,9 +948,24 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 		run.Verdict = verdict
 		run.Body = body
 		run.GithubReviewID = githubReviewID
+		run.Publication = publication
 		run.AutoInjectReview = session.AutoInjectReview
-		if githubReviewID != "" && s.reviewRefresher != nil {
-			s.reviewRefresher.RequestReviewRefresh(run.PRURL)
+		request := ports.ReviewRefreshRequest{RunID: run.ID, WorkerID: workerID, PRURL: run.PRURL, TargetSHA: run.TargetSHA}
+		ctx = reviewtrace.WithRequests(ctx, []ports.ReviewRefreshRequest{request})
+		publicationState := "absent"
+		if run.Publication != nil {
+			publicationState = run.Publication.Status
+		} else if run.PublishedToProvider() {
+			publicationState = "published"
+		}
+		reviewtrace.Emit(ctx, "receipt_recorded", publicationState)
+		if run.PublishedToProvider() {
+			if s.reviewRefresher == nil {
+				reviewtrace.Emit(ctx, "refresh_dropped", "unavailable")
+			} else {
+				reviewtrace.Emit(ctx, "refresh_requested", "accepted")
+				s.reviewRefresher.RequestReviewRefresh(ctx, request)
+			}
 		}
 		// Only on the real running -> complete transition. Re-submitting an
 		// already-complete run returns early below, so telemetry stays idempotent
@@ -935,7 +974,7 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			"harness":            string(run.Harness),
 			"verdict":            string(verdict),
 			"duration_ms":        s.clock().Sub(run.CreatedAt).Milliseconds(),
-			"posted_to_provider": githubReviewID != "",
+			"posted_to_provider": run.PublishedToProvider(),
 			// Which pass produced this verdict. A manual and an automatic review
 			// mean different things about how the feature is being used, and the
 			// verdict split between them is the whole question.
@@ -949,6 +988,12 @@ func (s *Service) submitOne(ctx context.Context, workerID domain.SessionID, revi
 			"auto_inject": session.AutoInjectReview,
 		})
 	case domain.ReviewRunComplete:
+		if review.Publication != nil {
+			publication, _, err := validatePublication(run, review)
+			if err != nil || !reflect.DeepEqual(publication, run.Publication) {
+				return domain.ReviewRun{}, fmt.Errorf("%w: review run %q already recorded a different publication", ErrInvalid, runID)
+			}
+		}
 		if run.Verdict != verdict {
 			return domain.ReviewRun{}, fmt.Errorf("%w: review run %q already recorded verdict %q", ErrInvalid, runID, run.Verdict)
 		}

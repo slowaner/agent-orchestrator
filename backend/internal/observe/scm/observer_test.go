@@ -128,6 +128,7 @@ type fakeProvider struct {
 	logTails     map[string]string
 	fetchErr     error
 	reviewErr    error
+	onReview     func()
 
 	// fetchObsErrors maps a prKey to a per-observation error that the fake
 	// attaches to the observation it returns for that ref, mimicking the
@@ -253,6 +254,9 @@ func (p *fakeProvider) FetchReviewThreads(_ context.Context, ref ports.SCMPRRef)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.reviewCalls++
+	if p.onReview != nil {
+		p.onReview()
+	}
 	if p.reviewErr != nil {
 		return ports.SCMReviewObservation{}, p.reviewErr
 	}
@@ -3740,7 +3744,7 @@ func TestPoll_RequestedReviewRefreshFetchesThreadsOnce(t *testing.T) {
 		t.Fatalf("unrequested poll fetched: reviews=%d batches=%d", provider.reviewCalls, len(provider.fetchBatches))
 	}
 
-	obs.RequestReviewRefresh(local.URL)
+	obs.RequestReviewRefresh(t.Context(), ports.ReviewRefreshRequest{RunID: "run", PRURL: local.URL})
 	select {
 	case <-obs.trigger:
 	default:
@@ -3784,7 +3788,7 @@ func TestPoll_RequestedReviewRefreshRespectsRateLimitCooldown(t *testing.T) {
 	obs.Cache.LastSyncCursor[prKey(testRepo, 0)] = time.Unix(190, 0).UTC()
 	obs.setRateLimitCooldown(now, "github", 2*time.Minute)
 
-	obs.RequestReviewRefresh(local.URL)
+	obs.RequestReviewRefresh(t.Context(), ports.ReviewRefreshRequest{RunID: "run", PRURL: local.URL})
 	if err := obs.Poll(context.Background()); err != nil {
 		t.Fatal(err)
 	}

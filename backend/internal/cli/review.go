@@ -12,6 +12,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 )
@@ -23,19 +24,21 @@ const (
 
 // reviewRun mirrors the daemon's domain.ReviewRun for the CLI client.
 type reviewRun struct {
-	ID             string     `json:"id"`
-	ReviewID       string     `json:"reviewId"`
-	SessionID      string     `json:"sessionId"`
-	BatchID        string     `json:"batchId"`
-	Harness        string     `json:"harness"`
-	PRURL          string     `json:"prUrl"`
-	TargetSHA      string     `json:"targetSha"`
-	Status         string     `json:"status"`
-	Verdict        string     `json:"verdict"`
-	Body           string     `json:"body"`
-	GithubReviewID string     `json:"githubReviewId"`
-	CreatedAt      time.Time  `json:"createdAt"`
-	DeliveredAt    *time.Time `json:"deliveredAt,omitempty"`
+	ID               string             `json:"id"`
+	ReviewID         string             `json:"reviewId"`
+	SessionID        string             `json:"sessionId"`
+	BatchID          string             `json:"batchId"`
+	Harness          string             `json:"harness"`
+	PRURL            string             `json:"prUrl"`
+	TargetSHA        string             `json:"targetSha"`
+	Status           string             `json:"status"`
+	Verdict          string             `json:"verdict"`
+	Body             string             `json:"body"`
+	GithubReviewID   string             `json:"githubReviewId"`
+	Publication      *reviewPublication `json:"publication,omitempty"`
+	PublicationRoute string             `json:"publicationRoute,omitempty"`
+	CreatedAt        time.Time          `json:"createdAt"`
+	DeliveredAt      *time.Time         `json:"deliveredAt,omitempty"`
 }
 
 type reviewState struct {
@@ -68,6 +71,7 @@ type triggerReviewRequest struct {
 	Harness            string             `json:"harness,omitempty"`
 	AgentConfig        *reviewAgentConfig `json:"agentConfig,omitempty"`
 	PRURL              string             `json:"prUrl,omitempty"`
+	PublicationRoute   string             `json:"publicationRoute,omitempty"`
 	Source             string             `json:"source,omitempty"`
 	RejectReviewedHead bool               `json:"rejectReviewedHead,omitempty"`
 	Rerun              bool               `json:"rerun,omitempty"`
@@ -88,12 +92,28 @@ type reviewRunResponse struct {
 	ReviewerHandleID string      `json:"reviewerHandleId"`
 }
 
+// reviewPublication mirrors domain.ReviewPublication without importing daemon code.
+type reviewPublication struct {
+	Provider  string                 `json:"provider"`
+	Status    string                 `json:"status"`
+	PRURL     string                 `json:"prUrl"`
+	TargetSHA string                 `json:"targetSha"`
+	Refs      []reviewPublicationRef `json:"refs,omitempty"`
+	Error     string                 `json:"error,omitempty"`
+}
+
+type reviewPublicationRef struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+}
+
 // submitReviewItem mirrors controllers.SubmitReviewItem.
 type submitReviewItem struct {
-	RunID          string `json:"runId"`
-	Verdict        string `json:"verdict"`
-	Body           string `json:"body,omitempty"`
-	GithubReviewID string `json:"githubReviewId,omitempty"`
+	RunID          string             `json:"runId"`
+	Verdict        string             `json:"verdict"`
+	Body           string             `json:"body,omitempty"`
+	GithubReviewID string             `json:"githubReviewId,omitempty"`
+	Publication    *reviewPublication `json:"publication,omitempty"`
 }
 
 // submitReviewRequest mirrors controllers.SubmitReviewInput.
@@ -102,6 +122,7 @@ type submitReviewRequest struct {
 	Verdict        string             `json:"verdict,omitempty"`
 	Body           string             `json:"body,omitempty"`
 	GithubReviewID string             `json:"githubReviewId,omitempty"`
+	Publication    *reviewPublication `json:"publication,omitempty"`
 	Reviews        []submitReviewItem `json:"reviews,omitempty"`
 }
 
@@ -119,13 +140,14 @@ type reviewSessionOptions struct {
 }
 
 type reviewTriggerOptions struct {
-	session  string
-	prURL    string
-	harness  string
-	model    string
-	effort   string
-	rerun    bool
-	noInject bool
+	session          string
+	prURL            string
+	harness          string
+	model            string
+	effort           string
+	rerun            bool
+	noInject         bool
+	publicationRoute string
 }
 
 // envReviewSessionID is set only inside reviewer panes (see
@@ -391,6 +413,7 @@ approval and does not authorize merging.`,
 	f.StringVar(&opts.effort, "effort", "", "Reviewer reasoning effort for this pass only")
 	f.BoolVar(&opts.rerun, "rerun", false, "Review heads that already have a review again, or add another reviewer alongside a running one")
 	f.BoolVar(&opts.noInject, "no-inject", false, "Leave the session's review auto-inject setting unchanged")
+	f.StringVar(&opts.publicationRoute, "publication-route", "auto", "Reviewer publication instructions: auto, mcp or glab; explicit routes require one GitLab --pr and do not grant access")
 	return cmd
 }
 
@@ -402,7 +425,11 @@ func (c *commandContext) triggerReview(cmd *cobra.Command, args []string, opts r
 	if session == "" {
 		return usageError{errors.New("usage: worker session id is required (positional or --session) outside an AO session")}
 	}
+	if err := domain.ReviewPublicationRoute(opts.publicationRoute).ValidateTarget(strings.TrimSpace(opts.prURL)); err != nil {
+		return usageError{err}
+	}
 	req := triggerReviewRequest{
+		PublicationRoute:   opts.publicationRoute,
 		Harness:            strings.TrimSpace(opts.harness),
 		PRURL:              strings.TrimSpace(opts.prURL),
 		RejectReviewedHead: !opts.rerun,

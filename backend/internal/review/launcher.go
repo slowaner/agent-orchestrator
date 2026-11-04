@@ -65,17 +65,19 @@ type Launcher interface {
 
 // LaunchSpec is the engine's request to (re)launch a reviewer for one pass.
 type LaunchSpec struct {
-	RunID           string
-	BatchID         string
-	ReviewSessionID string
-	LaunchID        string
-	WorkerID        domain.SessionID
-	ProjectID       domain.ProjectID
-	ProjectEnv      map[string]string
-	Harness         domain.ReviewerHarness
-	AgentConfig     domain.AgentConfig
-	WorkspacePath   string
-	AgentSessionID  string
+	// PublicationRoute is the persisted per-run instruction selector.
+	PublicationRoute domain.ReviewPublicationRoute
+	RunID            string
+	BatchID          string
+	ReviewSessionID  string
+	LaunchID         string
+	WorkerID         domain.SessionID
+	ProjectID        domain.ProjectID
+	ProjectEnv       map[string]string
+	Harness          domain.ReviewerHarness
+	AgentConfig      domain.AgentConfig
+	WorkspacePath    string
+	AgentSessionID   string
 	// ProviderConversationID is the typed Chat driver's stable conversation id.
 	// Terminal reviewers continue to use AgentSessionID.
 	ProviderConversationID string
@@ -104,6 +106,9 @@ type LaunchResult struct {
 
 // ReviewerChatStart is the transport-neutral typed reviewer launch request.
 type ReviewerChatStart struct {
+	// ReviewerApproval binds human requests to this review run and full head.
+	// Nil grants no read-only approval authority; idle-only rebinding applies.
+	ReviewerApproval       *ports.ReviewerApprovalScope
 	BatchID                string
 	ReviewID               string
 	WorkerID               domain.SessionID
@@ -433,6 +438,13 @@ func previousReviewHistoryText(runs []domain.ReviewRun) string {
 		if run.Verdict != "" {
 			fmt.Fprintf(&b, ", verdict: %s", run.Verdict)
 		}
+		fmt.Fprintf(&b, ", selected publication route: %s (instructions only)", run.PublicationRoute.Normalized())
+		if run.Publication != nil {
+			fmt.Fprintf(&b, ", provider publication: %s (%s)", run.Publication.Status, run.Publication.Provider)
+			for _, ref := range run.Publication.Refs {
+				fmt.Fprintf(&b, ", %s: %s", ref.Kind, ref.ID)
+			}
+		}
 		if run.GithubReviewID != "" {
 			fmt.Fprintf(&b, ", GitHub review: %s", run.GithubReviewID)
 		}
@@ -496,7 +508,11 @@ func (l *agentLauncher) startReviewerChat(ctx context.Context, spec LaunchSpec, 
 	if spec.DeferInitialMessage {
 		prompt = ""
 	}
-	start := ReviewerChatStart{BatchID: spec.BatchID, ReviewID: spec.ReviewSessionID, WorkerID: spec.WorkerID, ProjectID: spec.ProjectID, Harness: profile.ReviewChatHarness(), Model: spec.AgentConfig.Model, Effort: spec.AgentConfig.Effort, DataDir: l.dataDir, WorkspacePath: spec.WorkspacePath, Env: l.runtimeEnv(ctx, spec, nil, nil), Prompt: prompt, SystemPrompt: string(systemPrompt), ProviderConversationID: providerID}
+	var approval *ports.ReviewerApprovalScope
+	if profile.ReviewChatHarness() == domain.HarnessCodex {
+		approval = reviewerApprovalScope(spec)
+	}
+	start := ReviewerChatStart{ReviewerApproval: approval, BatchID: spec.BatchID, ReviewID: spec.ReviewSessionID, WorkerID: spec.WorkerID, ProjectID: spec.ProjectID, Harness: profile.ReviewChatHarness(), Model: spec.AgentConfig.Model, Effort: spec.AgentConfig.Effort, DataDir: l.dataDir, WorkspacePath: spec.WorkspacePath, Env: l.runtimeEnv(ctx, spec, nil, nil), Prompt: prompt, SystemPrompt: string(systemPrompt), ProviderConversationID: providerID}
 	if restore {
 		providerID, err = l.chat.RestoreReviewChat(ctx, start)
 	} else {
@@ -764,6 +780,14 @@ func (l *agentLauncher) Notify(ctx context.Context, handleID string, spec Launch
 		return fmt.Errorf("reviewer message: %w", err)
 	}
 	if reviewID, ok := reviewerChatID(handleID); ok && l.chat != nil {
+		if profile, supported := reviewer.(ports.ReviewerChatProfile); supported && profile.ReviewChatHarness() == domain.HarnessCodex {
+			// Start reuses the existing controller but validates and rebinds its
+			// idle approval context before the next pass can dispatch any tools.
+			spec.DeferInitialMessage = true
+			if _, err := l.startReviewerChat(ctx, spec, inv, profile, false); err != nil {
+				return fmt.Errorf("rebind reviewer approval scope: %w", err)
+			}
+		}
 		return l.chat.SendReviewChat(ctx, reviewID, msg, spec.BatchID)
 	}
 	if err := l.runtime.SendMessage(ctx, ports.RuntimeHandle{ID: handleID}, msg); err != nil {

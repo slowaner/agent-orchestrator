@@ -12,6 +12,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/config"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	scmobserve "github.com/aoagents/agent-orchestrator/backend/internal/observe/scm"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/reviewtrace"
 	reviewsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/review"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
@@ -20,7 +22,7 @@ import (
 // and GitLab providers via a multi Provider dispatcher. Missing credentials
 // for one provider do not prevent the other from starting; the observer is
 // disabled only when no provider has usable credentials.
-func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, branchStates scmobserve.BranchStateReconciler, gitlabCfg config.GitLabConfig, reviewRefresher *scmReviewRefresher, logger *slog.Logger) <-chan struct{} {
+func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.Manager, branchStates scmobserve.BranchStateReconciler, gitlabCfg config.GitLabConfig, reviewRefresher *scmReviewRefresher, logger *slog.Logger, traceEnabled ...bool) <-chan struct{} {
 	var named []scmmulti.NamedProvider
 
 	ghProvider, ghErr := newGitHubSCMProvider(logger)
@@ -42,7 +44,7 @@ func startSCMObserver(ctx context.Context, store *sqlite.Store, lcm *lifecycle.M
 		return closedDone()
 	}
 	provider := scmmulti.New(named...)
-	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{Logger: logger, ScopedIdentityResolver: provider, BranchStates: branchStates})
+	observer := scmobserve.New(provider, store, lcm, scmobserve.Config{TraceEvents: len(traceEnabled) > 0 && traceEnabled[0], Logger: logger, ScopedIdentityResolver: provider, BranchStates: branchStates})
 	reviewRefresher.Bind(observer)
 	return observer.Start(ctx)
 }
@@ -137,15 +139,19 @@ func (r *scmReviewRefresher) Bind(target reviewsvc.ThreadRefresher) {
 }
 
 // RequestReviewRefresh forwards to the bound observer without blocking.
-func (r *scmReviewRefresher) RequestReviewRefresh(prURL string) {
+func (r *scmReviewRefresher) RequestReviewRefresh(ctx context.Context, request ports.ReviewRefreshRequest) {
 	if r == nil {
+		reviewtrace.Emit(ctx, "refresh_dropped", "unavailable")
 		return
 	}
 	r.mu.RLock()
 	target := r.target
 	r.mu.RUnlock()
 	if target != nil {
-		target.RequestReviewRefresh(prURL)
+		reviewtrace.Emit(ctx, "refresh_bridge", "bound")
+		target.RequestReviewRefresh(ctx, request)
+	} else {
+		reviewtrace.Emit(ctx, "refresh_dropped", "unavailable")
 	}
 }
 

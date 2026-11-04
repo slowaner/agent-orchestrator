@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -44,15 +45,23 @@ var approvalMethods = map[string]domain.ActivityKind{
 
 // conversation is one live Codex thread. It is the only writer to that thread.
 type conversation struct {
-	conn *conn
-	proc *process
-	log  *slog.Logger
+	approvalReady     chan struct{}
+	approvalReadyOnce sync.Once
+	conn              *conn
+	proc              *process
+	log               *slog.Logger
 
-	threadID        string
-	historyParentID string
-	providerScopeID string
-	readOnly        bool
-	disableNetwork  bool
+	threadID               string
+	historyParentID        string
+	providerScopeID        string
+	readOnly               bool
+	disableNetwork         bool
+	reviewerApproval       atomic.Pointer[ports.ReviewerApprovalScope]
+	reviewerApprovalPolicy json.RawMessage
+	reviewerCwd            string
+	reviewerApprovalEpoch  string
+	reviewerApprovalOrigin string
+	reviewerSandbox        json.RawMessage
 	// launchMode is the permission mode the thread started or resumed with;
 	// a turn without its own approval setting runs under it.
 	launchMode ports.PermissionMode
@@ -124,15 +133,51 @@ var _ ports.ChatMCPReloader = (*conversation)(nil)
 
 func newConversation(proc *process, log *slog.Logger, providerScopeID string) *conversation {
 	c := &conversation{
-		proc:            proc,
-		log:             log,
-		events:          make(chan ports.ChatEvent, eventBuffer),
-		pending:         make(map[string]*parkedRequest),
-		pumpDone:        make(chan struct{}),
-		providerScopeID: providerScopeID,
+		proc:                  proc,
+		log:                   log,
+		events:                make(chan ports.ChatEvent, eventBuffer),
+		pending:               make(map[string]*parkedRequest),
+		pumpDone:              make(chan struct{}),
+		providerScopeID:       providerScopeID,
+		approvalReady:         make(chan struct{}),
+		reviewerApprovalEpoch: newReviewerApprovalEpoch(),
 	}
 	c.conn = newConnAt(proc.stdin, proc.stdout, log, c.handleServerRequest, proc.nextRequestID)
 	return c
+}
+
+// restoreActiveTurn recovers the surviving thread's current turn before start
+// releases replayed approval/input requests. A request's own turn ID is never
+// evidence that the turn is still active.
+func (c *conversation) restoreActiveTurn(ctx context.Context, threadID string) error {
+	var response codexproto.ThreadReadResponse
+	includeTurns := true
+	if err := c.conn.request(ctx, codexproto.MethodThreadRead, codexproto.ThreadReadParams{ThreadID: threadID, IncludeTurns: &includeTurns}, &response); err != nil {
+		return fmt.Errorf("read surviving reviewer turn: %w", err)
+	}
+	if response.Thread.ID != threadID {
+		return fmt.Errorf("surviving reviewer thread mismatch: got %q, want %q", response.Thread.ID, threadID)
+	}
+	active := ""
+	for _, turn := range response.Thread.Turns {
+		if turn.ID == "" {
+			return errors.New("surviving reviewer turn has no ID")
+		}
+		switch turn.Status {
+		case codexproto.TurnStatusInProgress:
+			if active != "" {
+				return errors.New("surviving reviewer thread has multiple active turns")
+			}
+			active = turn.ID
+		case codexproto.TurnStatusCompleted, codexproto.TurnStatusInterrupted, codexproto.TurnStatusFailed:
+		default:
+			return fmt.Errorf("unsupported surviving reviewer turn status %q", turn.Status)
+		}
+	}
+	c.mu.Lock()
+	c.activeTurn = active
+	c.mu.Unlock()
+	return nil
 }
 
 // start records the opened thread and begins translating notifications. It is
@@ -143,6 +188,9 @@ func (c *conversation) start(threadID, model, effort string) {
 	c.threadModel = model
 	c.threadEffort = effort
 	go c.pump()
+	if c.approvalReady != nil {
+		c.approvalReadyOnce.Do(func() { close(c.approvalReady) })
+	}
 }
 
 // ProviderConversationID is the Codex thread id AO persists for resume.
@@ -252,6 +300,9 @@ func (c *conversation) pump() {
 					c.activeTurn = ""
 				}
 				c.mu.Unlock()
+				if c.readOnly {
+					c.cancelCompletedTurnApprovals(ev.ProviderTurnID)
+				}
 			}
 			if ev.Kind == ports.ChatEventCompacted {
 				settled, ok := c.settleCompaction(ev)
@@ -365,6 +416,7 @@ func (c *conversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) 
 		params["clientUserMessageId"] = msg.ClientMessageID
 	}
 	applyTurnSettings(params, msg.Settings, c.readOnly, c.disableNetwork)
+	c.applyReviewerApproval(params)
 	// A service tier sticks to the thread once set, so leaving the fast tier
 	// has to be said: an explicit null returns the thread to its default.
 	if msg.Settings.Fast {
@@ -746,8 +798,17 @@ func (c *conversation) ResolveRequest(ctx context.Context, requestID string, dec
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	requestID = c.nativeID(requestID)
 	c.mu.Lock()
+	if c.readOnly && c.reviewerApproval.Load() == nil {
+		c.mu.Unlock()
+		return ports.ErrChatRequestNotPending
+	}
+	var valid bool
+	requestID, valid = c.nativeReviewerRequestID(c.nativeID(requestID))
+	if !valid {
+		c.mu.Unlock()
+		return ports.ErrChatRequestNotPending
+	}
 	parked, ok := c.pending[requestID]
 	closed := c.closed
 	if closed {
@@ -763,6 +824,10 @@ func (c *conversation) ResolveRequest(ctx context.Context, requestID string, dec
 		// Already resolved, superseded, or from a previous controller. Refusing is
 		// required: a stale card must never resolve a newer request.
 		return fmt.Errorf("%w: %q", ports.ErrChatRequestNotPending, requestID)
+	}
+	if parked.cancelled || (c.reviewerApproval.Load() != nil && parked.turnID != c.activeTurn) {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: reviewer turn is no longer active", ports.ErrChatRequestNotPending)
 	}
 	reply, err := parked.reply(decision)
 	if err != nil {
@@ -788,8 +853,10 @@ func (c *conversation) ResolveRequest(ctx context.Context, requestID string, dec
 // (acceptWithExecpolicyAmendment), and a client that only knows the id cannot
 // reconstruct them. AO echoes what the provider sent rather than rebuilding it.
 type parkedRequest struct {
-	ch      chan ports.ChatDecision
-	offered map[string]json.RawMessage
+	ch        chan ports.ChatDecision
+	offered   map[string]json.RawMessage
+	turnID    string
+	cancelled bool
 }
 
 // reply resolves a client decision into the payload to send back.
@@ -820,13 +887,34 @@ func (p *parkedRequest) offeredIDs() []string {
 // than answering immediately. Everything AO does not model is refused with an
 // error, never with a fabricated decision.
 func (c *conversation) handleServerRequest(ctx context.Context, req serverRequest) (any, error) {
+	// A persistent host can replay a pending request before thread/start or
+	// resume finishes. Never interpret it with an uninitialized reviewer scope.
+	_, approvalRequest := approvalMethods[req.Method]
+	interactionRequest := approvalRequest || req.Method == codexproto.MethodItemToolRequestUserInput || req.Method == "mcpServer/elicitation/request"
+	if interactionRequest && c.approvalReady != nil {
+		select {
+		case <-c.approvalReady:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	switch req.Method {
 	case codexproto.MethodAccountChatgptAuthTokensRefresh:
 		return nil, c.reportAuthRefreshRequest(req.Params)
 	case codexproto.MethodItemToolCall:
 		return nil, c.refuseDynamicToolCall(req.Params)
 	case codexproto.MethodItemToolRequestUserInput:
+		if c.disableNetwork {
+			return nil, errors.New("background task does not permit approval or input requests")
+		}
+		if c.readOnly || c.reviewerApproval.Load() != nil {
+			if response, handled, err := c.reviewerMCPInput(ctx, req); handled {
+				return response, err
+			}
+		}
 		return c.requestUserInput(ctx, req)
+	case "mcpServer/elicitation/request":
+		return c.reviewerMCPElicitation(ctx, req)
 	}
 
 	kind, known := approvalMethods[req.Method]
@@ -844,7 +932,38 @@ func (c *conversation) handleServerRequest(ctx context.Context, req serverReques
 	}
 
 	decisions, summary, detail, turnID := parseApproval(req.Method, req.Params)
+	scope := c.reviewerApproval.Load()
+	if c.readOnly && scope == nil {
+		return nil, errors.New("read-only reviewer has no active approval scope")
+	}
+	if scope != nil {
+		var payload approvalPayload
+		if json.Unmarshal(req.Params, &payload) != nil {
+			return nil, errors.New("invalid reviewer approval request")
+		}
+		c.mu.Lock()
+		current := c.reviewerRequestCurrent(payload.ThreadID, payload.TurnID)
+		c.mu.Unlock()
+		if !current || req.Method != codexproto.MethodItemCommandExecutionRequestApproval {
+			return nil, errors.New("unsupported or stale reviewer approval request")
+		}
+		if len(payload.AvailableDecisions) == 0 {
+			// Native 0.164 command requests can omit availableDecisions. The
+			// response schema still defines these three nonpersistent decisions.
+			decisions = reviewerApprovalOptions("accept", "decline", "cancel")
+		}
+		decisions = reviewerDecisionOptions(decisions)
+		if len(decisions) == 0 {
+			return nil, errors.New("native reviewer request offers no approve-once/decline/cancel decisions")
+		}
+		detail = reviewerApprovalDetail(detail, *scope)
+	}
 
+	return c.awaitApproval(ctx, req, kind, decisions, summary, detail, turnID, scope, approvalReply)
+}
+
+func (c *conversation) awaitApproval(ctx context.Context, req serverRequest, kind domain.ActivityKind, decisions []ports.ChatDecisionOption, summary string, detail []byte, turnID string, expectedScope *ports.ReviewerApprovalScope, reply func(ports.ChatDecision) any) (any, error) {
+	requestID := rawID(req.ID)
 	offered := make(map[string]json.RawMessage, len(decisions))
 	for _, option := range decisions {
 		offered[option.ID] = option.Raw
@@ -856,11 +975,24 @@ func (c *conversation) handleServerRequest(ctx context.Context, req serverReques
 		c.mu.Unlock()
 		return nil, errConversationClosed
 	}
+	currentScope := c.reviewerApproval.Load()
+	if c.readOnly && currentScope == nil {
+		c.mu.Unlock()
+		return nil, errors.New("read-only reviewer approval scope ended")
+	}
+	if expectedScope != nil && (currentScope == nil || *expectedScope != *currentScope) {
+		c.mu.Unlock()
+		return nil, errors.New("reviewer approval run changed before request registration")
+	}
+	if currentScope != nil && (turnID == "" || turnID != c.activeTurn) {
+		c.mu.Unlock()
+		return nil, errors.New("reviewer approval turn is no longer active")
+	}
 	if c.pending[requestID] != nil || c.pendingInputs[requestID] != nil {
 		c.mu.Unlock()
 		return nil, errors.New("server request id is already pending")
 	}
-	c.pending[requestID] = &parkedRequest{ch: ch, offered: offered}
+	c.pending[requestID] = &parkedRequest{ch: ch, offered: offered, turnID: turnID}
 	c.mu.Unlock()
 
 	c.emit(ports.ChatEvent{
@@ -876,8 +1008,11 @@ func (c *conversation) handleServerRequest(ctx context.Context, req serverReques
 	})
 
 	select {
-	case decision := <-ch:
-		return approvalReply(decision), nil
+	case decision, open := <-ch:
+		if !open {
+			return nil, errConversationClosed
+		}
+		return reply(decision), nil
 
 	case <-time.After(approvalWait):
 		c.discardPending(requestID)
@@ -1007,6 +1142,30 @@ func (c *conversation) ReloadMCPServers(ctx context.Context) (ports.ChatMCPReloa
 	return ports.ChatMCPReloadResult{Servers: servers, Authoritative: true}, nil
 }
 
+// cancelCompletedTurnApprovals settles only approvals whose native turn has
+// ended. Keeping them registered until the resolved event is emitted prevents
+// a new run from rebinding their public request namespace during cancellation.
+func (c *conversation) cancelCompletedTurnApprovals(turnID string) {
+	c.mu.Lock()
+	pending := make(map[string]*parkedRequest)
+	for id, request := range c.pending {
+		if request.turnID == turnID && !request.cancelled {
+			request.cancelled = true
+			pending[id] = request
+		}
+	}
+	c.mu.Unlock()
+	for id, request := range pending {
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventApprovalResolved, RequestID: id, ProviderItemID: id, ProviderTurnID: turnID, Detail: []byte(`{"decision":"cancel","reason":"native_turn_completed"}`)})
+		c.mu.Lock()
+		if c.pending[id] == request {
+			delete(c.pending, id)
+			request.ch <- ports.ChatDecision{ID: "cancel"}
+		}
+		c.mu.Unlock()
+	}
+}
+
 func (c *conversation) discardPending(requestID string) {
 	c.mu.Lock()
 	delete(c.pending, requestID)
@@ -1086,12 +1245,14 @@ func (c *conversation) Hibernate() error { return c.Terminate() }
 
 // approvalPayload is the subset of an approval request AO renders.
 type approvalPayload struct {
-	ThreadID string `json:"threadId"`
-	TurnID   string `json:"turnId"`
-	ItemID   string `json:"itemId"`
-	Command  string `json:"command"`
-	Cwd      string `json:"cwd"`
-	Reason   string `json:"reason"`
+	ThreadID               string          `json:"threadId"`
+	TurnID                 string          `json:"turnId"`
+	ItemID                 string          `json:"itemId"`
+	Command                string          `json:"command"`
+	Cwd                    string          `json:"cwd"`
+	Reason                 string          `json:"reason"`
+	NetworkApprovalContext json.RawMessage `json:"networkApprovalContext"`
+	AdditionalPermissions  json.RawMessage `json:"additionalPermissions"`
 	// AvailableDecisions is authoritative: the provider varies the offered set
 	// per request and does not always offer a plain decline, so a client must
 	// render from this rather than a fixed set of buttons.
@@ -1123,6 +1284,12 @@ func parseApproval(method string, params json.RawMessage) ([]ports.ChatDecisionO
 	}
 
 	detail := map[string]any{"method": method}
+	if len(p.NetworkApprovalContext) > 0 {
+		detail["networkApprovalContext"] = p.NetworkApprovalContext
+	}
+	if len(p.AdditionalPermissions) > 0 {
+		detail["additionalPermissions"] = p.AdditionalPermissions
+	}
 	if p.Command != "" {
 		detail["command"] = commanddetail.UnwrapShell(p.Command)
 		detail["rawCommand"] = p.Command

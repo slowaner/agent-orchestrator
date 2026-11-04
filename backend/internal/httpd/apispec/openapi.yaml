@@ -19508,6 +19508,50 @@ components:
         turnId:
           type: string
       type: object
+    ReviewPublication:
+      properties:
+        error:
+          type: string
+        prUrl:
+          type: string
+        provider:
+          enum:
+          - github
+          - gitlab
+          type: string
+        refs:
+          items:
+            $ref: '#/components/schemas/ReviewPublicationRef'
+          type: array
+        status:
+          enum:
+          - published
+          - blocked
+          - unconfirmed
+          type: string
+        targetSha:
+          type: string
+      required:
+      - provider
+      - status
+      - prUrl
+      - targetSha
+      type: object
+    ReviewPublicationRef:
+      properties:
+        id:
+          type: string
+        kind:
+          enum:
+          - review
+          - note
+          - discussion
+          - draft_note
+          type: string
+      required:
+      - kind
+      - id
+      type: object
     ReviewRun:
       properties:
         autoInjectReview:
@@ -19532,6 +19576,8 @@ components:
           type: string
         prUrl:
           type: string
+        publication:
+          $ref: '#/components/schemas/ReviewPublication'
         reviewId:
           type: string
         sessionId:
@@ -21649,6 +21695,8 @@ components:
         githubReviewId:
           description: Id of the GitHub PR review the reviewer posted, if any.
           type: string
+        publication:
+          $ref: '#/components/schemas/ReviewPublication'
         reviews:
           description: Batched review results recorded by one reviewer CLI command.
           items:
@@ -21669,6 +21717,8 @@ components:
         githubReviewId:
           description: Id of the GitHub PR review the reviewer posted, if any.
           type: string
+        publication:
+          $ref: '#/components/schemas/ReviewPublication'
         runId:
           description: Review run id being completed.
           type: string
